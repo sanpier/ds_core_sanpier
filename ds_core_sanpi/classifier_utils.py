@@ -4,6 +4,7 @@ import multiprocessing
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import shap
 import time
 from azureml.core import Run
 from catboost import CatBoostClassifier
@@ -22,7 +23,7 @@ from sklearn.tree import DecisionTreeClassifier
 class Classifier:
 
     dict_classifiers = {
-        #"LR": LogisticRegression(solver='liblinear'),
+        "LR": LogisticRegression(solver='liblinear'),
         "KNC": KNeighborsClassifier(),
         "SVC_linear": SVC(probability=True, kernel='linear'),
         "SVC_poly": SVC(probability=True, kernel='poly'),
@@ -122,26 +123,40 @@ class Classifier:
         y = self.y.copy()
         if not self.not_categorical_target:
             y = self.encoded_y.copy()
-        preds = cross_val_predict(model, self.X, y, cv=cv)  
+        self.pred_test = cross_val_predict(model, self.X, y, cv=cv)  
+        self.model = model
         scores = {}
-        scores["accuracy"] = round(accuracy_score(y, preds, normalize=True), 3)  
-        scores["recall"] = round(recall_score(y, preds, average='weighted'), 3) 
-        scores["precision"] = round(precision_score(y, preds, average='weighted'), 3)    
-        scores["f1_score"] = round(f1_score(y, preds, average='weighted'), 3)   
+        scores["accuracy"] = round(accuracy_score(y, self.pred_test, normalize=True), 3)  
+        scores["recall"] = round(recall_score(y, self.pred_test, average='weighted'), 3) 
+        scores["precision"] = round(precision_score(y, self.pred_test, average='weighted'), 3)    
+        scores["f1_score"] = round(f1_score(y, self.pred_test, average='weighted'), 3) 
+        if not self.not_categorical_target:
+            self.pred_test = self.le.inverse_transform(self.pred_test)  
         if confusion:
-            self.apply_confusion_matrix(preds)    
+            self.apply_confusion_matrix()    
         return scores
 
-    def apply_confusion_matrix(self, preds, name=""):
-        """ confusion matrix of the classification 
-        """        
+    def probability_prediction(self, model, cv=5):
+        """ do a cross validation predictions with probabilities
+        """
+        if model == "lr":
+            model = LogisticRegression()
+        elif model == "best":
+            model = self.best_model
+        elif model == "stack":
+            model = self.stacking_model()
         y = self.y.copy()
         if not self.not_categorical_target:
             y = self.encoded_y.copy()
-        cf_matrix = confusion_matrix(y, preds, labels=self.labels)
+        return cross_val_predict(model, self.X, y, cv=cv, method='predict_proba')
+   
+    def apply_confusion_matrix(self, name=""):
+        """ confusion matrix of the classification 
+        """        
+        cf_matrix = confusion_matrix(self.y, self.pred_test, labels=self.labels)
         cf_matrix_percentage = cf_matrix.astype('float') / cf_matrix.sum(axis=1)[:, np.newaxis] 
         fig_unit_size = len(self.labels)           
-        sns.set(rc={'figure.figsize':(fig_unit_size*6, fig_unit_size*3)})
+        sns.set(rc={'figure.figsize':(fig_unit_size*5, fig_unit_size*2)})
         fig, axs = plt.subplots(ncols=2)
         fig.suptitle(f"Confusion Matrix", fontsize=20)
         g1 = sns.heatmap(cf_matrix, annot=True, fmt='g', cmap='Blues', ax=axs[0])
@@ -200,6 +215,25 @@ class Classifier:
         model.fit(self.X, y)
         print("Model is fit on whole data!")
         self.trained_model = model
+
+    def explain_model_with_shap(self, model=None):
+        """ show SHAP values to explain the output of the regression model
+        """
+        if model is None:
+            if hasattr(self, 'model'): 
+                model = self.model
+            else:
+                raise AssertionError("Please pass over a model to proceed!")
+        # fit the model
+        self.train_model(model)
+        # set important features
+        importances = model.feature_importances_
+        sorted_idx = importances.argsort()[(-1*self.X.shape[1]):]
+        important_features = self.X.columns[sorted_idx].tolist() 
+        # get shap summary plot
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(self.X)
+        shap.summary_plot(shap_values, self.X, feature_names = important_features)
 
     def predict_test(self, test):
         """ train the given classification model on whole data
