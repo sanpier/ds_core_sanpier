@@ -1,16 +1,24 @@
+import gc
 import math
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import re
 import seaborn as sns
+import warnings
 from azureml.core import Run
-from ds_core_sanpi import Regressor, Classifier
+from utils.regressor_utils import Regressor
+from utils.classifier_utils import Classifier
 from lightgbm import LGBMRegressor, LGBMClassifier
 from lofo import LOFOImportance, Dataset, plot_importance
 from sklearn.decomposition import PCA
+from sklearn.impute import KNNImputer
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import confusion_matrix, make_scorer, accuracy_score, recall_score, precision_score, roc_auc_score, f1_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_squared_log_error, mean_absolute_percentage_error
+from sklearn.model_selection import cross_val_predict
 from sklearn.preprocessing import PowerTransformer, StandardScaler
+warnings.filterwarnings("ignore")
 
 
 class EDA_Preprocessor:
@@ -65,7 +73,7 @@ class EDA_Preprocessor:
         if self.online_run:
             self.run = Run.get_context()
 
-    def fill_missing_values(self, fill_by_zero_cols=None):
+    def fill_missing_values(self, fill_by_zero_cols=None, strategy="mean"):
         """ fill missing numeric values by mean and categorical features 
             with 'Unknown' 
         """
@@ -73,13 +81,133 @@ class EDA_Preprocessor:
         if fill_by_zero_cols:
             self.df[fill_by_zero_cols] = self.df[fill_by_zero_cols].fillna(0)
         # filling nan values in numeric cols
-        self.df[self.numeric_cols] = self.df[self.numeric_cols].fillna(
-            self.df[self.numeric_cols].mean()
-        ).fillna(0)
+        if strategy == "mean":
+            self.df[self.numeric_cols] = self.df[self.numeric_cols].fillna(
+                self.df[self.numeric_cols].mean()
+            ).fillna(0)
+        elif strategy == "median":
+            self.df[self.numeric_cols] = self.df[self.numeric_cols].fillna(
+                self.df[self.numeric_cols].median()
+            ).fillna(0)
+        elif strategy == "zero":
+            self.df[self.numeric_cols] = self.df[self.numeric_cols].fillna(0)
         # filling categorical cols with unknown class
         self.df[self.categorical_cols] = self.df[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
         print("After filling missing values in EDA data:")
         print(self.df.isna().sum())
+
+    def fill_given_col_by_mode(self, fill_col, by_mode_col):
+        """ fill column by other column's mode
+        """
+        self.df[fill_col] = self.df.apply(lambda row: self.fill_given_col_by_mode_row(row, fill_col, by_mode_col), axis=1)
+        
+    def fill_given_col_by_mode_row(self, row, fill_col, by_mode_col):
+        """ fill column by other column's mode per row
+        """
+        if (row[fill_col] == None) | (not row[fill_col]) | (row[fill_col] != row[fill_col]):
+            df_ = self.df[self.df[by_mode_col] == row[by_mode_col]]
+            if df_.shape[0] > 0:
+                return df_[fill_col].mode().iloc[0]
+            else: 
+                return row[fill_col]
+        else:
+            return row[fill_col]
+
+    def impute_with_knn(self, cols):
+        """ fill missing numeric values in given columns with KNN
+        """
+        # filling nan values in numeric cols
+        fill_numeric_cols = list(set(self.numeric_cols) - set(cols))
+        self.df[fill_numeric_cols] = self.df[fill_numeric_cols].fillna(
+            self.df[fill_numeric_cols].mean()
+        ).fillna(0)
+        # filling categorical cols with unknown class
+        self.df[self.categorical_cols] = self.df[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
+        # dummification
+        if len(self.categorical_cols) > 0:
+            self.dummification()
+        # split data
+        if not hasattr(self, 'X'): 
+            self.split_x_and_y()
+        # fill cols with knn
+        # define imputer
+        imputer = KNNImputer(n_neighbors=3, weights='distance')
+        # fit on the dataset
+        imputer.fit(self.X)
+        # transform the dataset
+        self.X = imputer.transform(self.X)
+        print("After filling missing values in X data:")
+        print(self.X.isna().sum())
+
+    def impute_with_classification(self, col):
+        """ fill missing numeric values in given columns with a
+            regression model
+        """
+        df_copy = self.df.copy()
+        categoric_cols = list(set(self.categorical_cols) - set([col]))
+        if len(categoric_cols) > 0:
+            # filling categorical cols with unknown class
+            df_copy[categoric_cols] = df_copy[categoric_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
+            # dummification
+            df_copy = pd.get_dummies(df_copy, columns=categoric_cols)
+            df_copy = df_copy.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
+        # choose columns to do modeling 
+        features = list(set(df_copy.columns[df_copy.notnull().all()]) - set(self.keep_cols))
+        df_copy = df_copy[features + [col]]
+        # impute by predictons
+        train_indexes = df_copy[df_copy[col].notnull()].index
+        test_indexes = df_copy[df_copy[col].isnull()].index
+        le = LabelEncoder()
+        encoded_y = le.fit_transform(df_copy.iloc[train_indexes][col])
+        classifier = LGBMClassifier()
+        # measure how good it is
+        preds = cross_val_predict(classifier, df_copy.iloc[train_indexes][features], encoded_y, cv=5)  
+        scores = {}
+        scores["accuracy"] = round(accuracy_score(encoded_y, preds, normalize=True), 3)  
+        scores["recall"] = round(recall_score(encoded_y, preds, average='weighted'), 3) 
+        scores["precision"] = round(precision_score(encoded_y, preds, average='weighted'), 3)    
+        scores["f1_score"] = round(f1_score(encoded_y, preds, average='weighted'), 3)       
+        [print('\t', key,':', val) for key, val in scores.items()]
+        # fit model
+        classifier.fit(df_copy.iloc[train_indexes][features], encoded_y)
+        preds = classifier.predict(df_copy.iloc[test_indexes][features])
+        self.df.loc[test_indexes, col] = le.inverse_transform(preds)
+        # release memory
+        gc.collect()
+        del df_copy
+
+    def impute_with_regression(self, col):
+        """ fill missing numeric values in given columns with a
+            classification model
+        """
+        df_copy = self.df.copy()
+        if len(self.categorical_cols) > 0:
+            # filling categorical cols with unknown class
+            df_copy[self.categorical_cols] = df_copy[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
+            # dummification
+            df_copy = pd.get_dummies(df_copy, columns=self.categorical_cols)
+            df_copy = df_copy.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
+        # choose columns to do modeling 
+        features = list(set(df_copy.columns[df_copy.notnull().all()]) - set(self.keep_cols))
+        df_copy = df_copy[features + [col]]
+        # impute by predictons
+        train_indexes = df_copy[df_copy[col].notnull()].index
+        test_indexes = df_copy[df_copy[col].isnull()].index
+        regressor = LGBMRegressor()
+        # measure how good it is
+        preds = cross_val_predict(regressor, df_copy.iloc[train_indexes][features], df_copy.iloc[train_indexes][col], cv=5) 
+        scores = {}
+        scores["MAE"] = round(mean_absolute_error(df_copy.iloc[train_indexes][col], preds), 3)  
+        scores["RMSE"] = round(mean_squared_error(df_copy.iloc[train_indexes][col], preds, squared=False), 3) 
+        scores["R2"] = round(r2_score(df_copy.iloc[train_indexes][col], preds), 3)    
+        scores["MAPE"] = round(mean_absolute_percentage_error(df_copy.iloc[train_indexes][col], preds), 3) 
+        [print('\t', key,':', val) for key, val in scores.items()]
+        # fit model
+        regressor.fit(df_copy.iloc[train_indexes][features], df_copy.iloc[train_indexes][col])
+        self.df.loc[test_indexes, col] = regressor.predict(df_copy.iloc[test_indexes][features])
+        # release memory
+        gc.collect()
+        del df_copy
 
     def align_cols(self, cols):
         """ align the dataframe with columns given 
@@ -107,6 +235,40 @@ class EDA_Preprocessor:
                 plt.close() 
         else:
             raise AssertionError("Please set a target feature first!")
+
+    def target_encoding_on_column(self, col, value_threshold):
+        """ target encode the given categorical column 
+        """
+        categories = self.df[col].unique()
+        df_ground_truth = self.df[self.df[self.target].notnull()]
+        for cat in categories:
+            if self.df[self.df[col] == cat].shape[0] > value_threshold:
+                self.df.loc[self.df[col] == cat, col] = df_ground_truth.loc[df_ground_truth[col] == cat, self.target].mean()
+            else:
+                self.df.loc[self.df[col] == cat, col] = df_ground_truth[self.target].mean()
+        self.df[col] = self.df[col].astype("float")
+
+    def target_encoding(self, category_threshold, value_threshold, all_of_them=False):
+        """ target encode all categorical columns 
+        """
+        if all_of_them==False:
+            # dummifiction
+            dummy_cols = [col for col in self.categorical_cols if len(self.df[col].unique()) <= category_threshold]
+            print("Dummfying ones with less than category threshold:", len(dummy_cols), "\n", dummy_cols)
+            self.df = pd.get_dummies(self.df, columns=dummy_cols)
+            self.df = self.df.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
+            # target encoding
+            target_cols = list(set(self.categorical_cols) - set(dummy_cols))
+            print("Selected categorical ones are now under the process of target encoding:", len(target_cols))
+            for category_col in target_cols:
+                self.target_encoding_on_column(category_col, value_threshold)
+                print(category_col, "is target encoded now!")
+        else:
+            # target encode all
+            print("All categorical ones are now under the process of target encoding:", len(self.categorical_cols))
+            for category_col in self.categorical_cols:
+                self.target_encoding_on_column(category_col, value_threshold)
+                print(category_col, "is target encoded now!")
 
     def dummification(self):
         """ get into dummy cols out of categorical features 
@@ -316,16 +478,21 @@ class EDA_Preprocessor:
     def split_x_and_y(self):
         """ split target from the data 
         """
-        if self.target != "":  
-            data = self.df[self.df[self.target].notnull()]
-            self.X = data.loc[:, list(set(data.columns) - set(self.keep_cols) - set([self.target]))].copy()
-            self.y = data[self.target].copy()
+        if self.target != "": 
+            df_ground_truth = self.df[self.df[self.target].notnull()]
+            self.X = df_ground_truth.loc[:, list(set(df_ground_truth.columns) - set(self.keep_cols) - set([self.target]))].copy()
+            self.y = df_ground_truth[self.target].copy()
             print("ID columns are removed from data:", len(self.keep_cols))
             print("Data is split into X and y:\n",
                   "\tX:", self.X.shape, "\n",
                   "\ty:", self.y.shape)
         else:
             raise AssertionError("Please set a target feature first!")
+
+    def set_test_data(self):
+        """ set test dataset """
+        self.test = self.df[self.df[self.target].isnull()]
+        self.test.reset_index(drop=True, inplace=True)
 
     def get_feature_importance(self, number_of_features=-1, name=""):
         """ get feature importance by LGBMClassifier model

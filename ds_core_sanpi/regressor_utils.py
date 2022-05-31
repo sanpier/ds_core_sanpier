@@ -8,7 +8,6 @@ import time
 from azureml.core import Run
 from catboost import CatBoostRegressor
 from concurrent import futures 
-from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMRegressor
 from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_squared_log_error, mean_absolute_percentage_error
@@ -60,15 +59,6 @@ class Regressor:
             print("Data is split into X and y:\n",
                   "\tX:", self.X.shape, "\n",
                   "\ty:", self.y.shape)
-
-    def oversampling(self):
-        """ oversampling method for imbalanced data
-        """
-        over = SMOTE(k_neighbors=25)
-        self.X, self.y = over.fit_resample(self.X, self.y)
-        print("After oversampling:\n",
-              "\tX:", self.X.shape, "\n",
-              "\ty:", self.y.shape, "\n")
 
     def experiment_models(self, cv=5, ratio_reg=False, calc_col=""):
         """ experiment the bunch of regression models for the problem
