@@ -8,6 +8,7 @@ import time
 from azureml.core import Run
 from catboost import CatBoostRegressor
 from concurrent import futures 
+from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMRegressor
 from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_squared_log_error, mean_absolute_percentage_error
@@ -59,6 +60,15 @@ class Regressor:
             print("Data is split into X and y:\n",
                   "\tX:", self.X.shape, "\n",
                   "\ty:", self.y.shape)
+
+    def oversampling(self):
+        """ oversampling method for imbalanced data
+        """
+        over = SMOTE(k_neighbors=25)
+        self.X, self.y = over.fit_resample(self.X, self.y)
+        print("After oversampling:\n",
+              "\tX:", self.X.shape, "\n",
+              "\ty:", self.y.shape, "\n")
 
     def experiment_models(self, cv=5, ratio_reg=False, calc_col=""):
         """ experiment the bunch of regression models for the problem
@@ -193,7 +203,9 @@ class Regressor:
             if ratio_reg:            
                 df_ratio["prediction"] = df_ratio[calc_col] / self.pred_test
                 df_ratio["actual"] = df_ratio[calc_col] / self.y
-            df_ratio["abs_percentage_error"] = round(100*(np.absolute(df_ratio["prediction"] - df_ratio["actual"])/df_ratio["actual"]), 1) 
+            df_ratio["error"] = df_ratio["prediction"] - df_ratio["actual"]
+            df_ratio["percentage_error"] = df_ratio["error"]/df_ratio["actual"] 
+            df_ratio["abs_percentage_error"] = round(100*(np.absolute(df_ratio["percentage_error"])), 1) 
             # regression metrics
             print("Regression metrics:")
             metrices = apply_regression_metrics(df_ratio["actual"], df_ratio["prediction"])
@@ -270,42 +282,108 @@ class Regressor:
         ax.set_ylabel('target value')
         plt.show()
 
-    def quantile_regression(self, quantiles=[0.5, 0.05, 0.075, 0.1, 0.125, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]): 
+    def quantile_regression(self, postprocessing, threshold_interval, quantiles=[0.5, 0.01, 0.05, 0.075, 0.1, 0.125, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]): 
         """ provides quantile regression predictions for all the given list
             of quantiles
         """
         df = pd.DataFrame({"ground-truth": self.y})
         for q in quantiles:
-            model = LGBMRegressor(objective = 'quantile', alpha = q)   
-            if q == 0.5:      
+            model = LGBMRegressor(objective = 'quantile', alpha = q)            
+            if q == 0.5:
                 scores = self.cv_score_model(model)
                 best_model = model
-                df["best_pred"] = self.pred_test
+                df["best_prediction"] = self.pred_test
                 df["abs_percentage_error"] = round(100*(np.absolute(self.pred_test - self.y)/self.y), 1)
-                df["ratio"] = df["best_pred"] / df["ground-truth"]
+                df["ratio"] = df["best_prediction"] / df["ground-truth"]
                 # report best predictions
                 print("Best quantile predictions:")
                 [print('\t', key,':', val) for key, val in scores.items()]
                 if self.online_run:
                     [self.run.log(f"{key}:", val) for key, val in scores.items()]  
-            else:          
+            else:
                 _ = self.cv_score_model(model)
                 df[f"{q}_pred"] = self.pred_test
                 model = LGBMRegressor(objective = 'quantile', alpha = 1-q)            
                 _ = self.cv_score_model(model)
                 df[f"{1-q}_pred"] = self.pred_test 
+                df[f"{q}-{1-q}_interval"] = df[f"{1-q}_pred"] - df[f"{q}_pred"]
+                
+                # postprocessing of quantile regression results
+                if postprocessing:
+                    df = self.postprocessing_quantile_regression(df, f"{q}_pred", f"{1-q}_pred", f"{q}-{1-q}_interval", threshold_interval)
+
                 # evaluate result
                 df[f"{q}-{1-q}_evaluation"] = np.where(((df[f"{q}_pred"] <= df["ground-truth"]) & (df[f"{1-q}_pred"] >= df["ground-truth"])), "Good", "Bad")
                 print("\nQuantiles:", q, 1-q)
-                df[f"{q}-{1-q}_interval"] = df[f"{1-q}_pred"] - df[f"{q}_pred"]
                 print(round(df[f"{q}-{1-q}_interval"].mean(), 2), "is the average of quantile range interval")
                 df_evaluation = df.groupby(f"{q}-{1-q}_evaluation").agg({'abs_percentage_error': 'mean', 'ground-truth': 'count'})
                 df_evaluation["percentage"] = df_evaluation["ground-truth"].apply(lambda x: "{0:.1%}".format(x/df_evaluation["ground-truth"].sum())) 
                 print(df_evaluation)
         # set best 
         self.model = best_model   
-        self.pred_test = df["best_pred"] 
+        self.pred_test = df["best_prediction"] 
         return df
+        
+    def quantile_regression_low_high_interval(self, threshold_interval, quantile): 
+        """ provides quantile regression predictions for all the given list
+            of quantiles
+        """
+        df = pd.DataFrame({"ground-truth": self.y})
+
+        # for quantile = quantile
+        model = LGBMRegressor(objective = 'quantile', alpha = quantile)            
+        _ = self.cv_score_model(model)
+        df["lowest_prediction"] = self.pred_test.round()
+        model = LGBMRegressor(objective = 'quantile', alpha = 1-quantile)            
+        _ = self.cv_score_model(model)
+        df["highest_prediction"] = self.pred_test.round() 
+        df["interval"] = df["highest_prediction"] - df["lowest_prediction"]
+  
+        # for quantile = 0.5
+        model = LGBMRegressor(objective = 'quantile', alpha = 0.5)            
+        scores = self.cv_score_model(model)
+        self.model = model   
+        df["best_prediction"] = self.pred_test.round()
+        df["abs_percentage_error"] = round(100*(np.absolute(self.pred_test - self.y)/self.y), 1)
+        df["ratio"] = df["best_prediction"] / df["ground-truth"]
+        
+        # postprocessing of quantile regression results
+        df = self.postprocessing_quantile_regression(df, "lowest_prediction", "highest_prediction", "interval", threshold_interval)
+
+        # report best predictions
+        print("Best quantile predictions:")
+        [print('\t', key,':', val) for key, val in scores.items()]
+        if self.online_run:
+            [self.run.log(f"{key}:", val) for key, val in scores.items()]  
+
+        # evaluate result
+        df["evaluation"] = np.where(((df["lowest_prediction"] <= df["ground-truth"]) & (df["highest_prediction"] >= df["ground-truth"])), "Good", "Bad")
+        print("\nQuantiles:", quantile, 1-quantile)
+        print(round(df["interval"].mean(), 2), "is the average of quantile range interval")
+        df_evaluation = df.groupby("evaluation").agg({'abs_percentage_error': 'mean', 'ground-truth': 'count'})
+        df_evaluation["percentage"] = df_evaluation["ground-truth"].apply(lambda x: "{0:.1%}".format(x/df_evaluation["ground-truth"].sum())) 
+        print(df_evaluation)
+
+        # set best   
+        self.pred_test = df["best_prediction"] 
+        return df
+
+    def postprocessing_quantile_regression(self, results, lowest_col, highest_col, interval_col, threshold_interval): 
+        """ quantile regression postprocessing """       
+        # swap lowest and highest predictions if lowest > highest 
+        condition = (results[lowest_col] > results[highest_col])
+        temp = results.loc[condition, lowest_col]
+        results.loc[condition, lowest_col] = results.loc[condition, highest_col]
+        results.loc[condition, highest_col] = temp
+        # force predictions btw. lowest and highest
+        condition = (results[lowest_col] > results["best_prediction"]) | (results["best_prediction"] > results[highest_col]) 
+        results.loc[condition, "best_prediction"] = ((results.loc[condition, highest_col] + results.loc[condition, lowest_col]) / 2).round()
+        # if predictions lie within an interval less than threshold  
+        condition = results[interval_col] <= threshold_interval
+        results.loc[condition, lowest_col] = results.loc[condition, "best_prediction"] - threshold_interval/2
+        results.loc[condition, highest_col] = results.loc[condition, "best_prediction"] + threshold_interval/2
+        results[interval_col] = results[highest_col] - results[lowest_col]
+        return results
         
     def classification_score_metrics(self):
         """ show relevant classification score metrics for the test data

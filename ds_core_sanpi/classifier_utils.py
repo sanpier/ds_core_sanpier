@@ -1,13 +1,14 @@
-from cProfile import label
-import lightgbm as lgbm
 import matplotlib.pyplot as plt
 import multiprocessing
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import shap
 import time
+from azureml.core import Run
 from catboost import CatBoostClassifier
 from concurrent import futures 
+from lightgbm import LGBMClassifier
 from sklearn.ensemble import BaggingClassifier, ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier, StackingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
 from sklearn.metrics import confusion_matrix, make_scorer, accuracy_score, recall_score, precision_score, roc_auc_score, f1_score
@@ -22,48 +23,56 @@ from sklearn.tree import DecisionTreeClassifier
 class Classifier:
 
     dict_classifiers = {
-        "LR": LogisticRegression(class_weight={0:1, 1:6}),
-        "Ridge": RidgeClassifier(class_weight={0:1, 1:4}),
-        #"KNC": KNeighborsClassifier(),
-        #"SVC_linear": SVC(probability=True, kernel='linear'),
-        #"SVC_poly": SVC(probability=True, kernel='poly'),
-        #"SVC_default": SVC(class_weight={0:1, 1:4}, probability=True, kernel="sigmoid"),
+        "LR": LogisticRegression(),
+        "Ridge": RidgeClassifier(),
+        "KNC": KNeighborsClassifier(),
+        "SVC_linear": SVC(probability=True, kernel='linear'),
+        "SVC_poly": SVC(probability=True, kernel='poly'),
+        "SVC_default": SVC(probability=True, kernel="sigmoid"),
         "GBC": GradientBoostingClassifier(),
-        "LGBMC": lgbm.LGBMClassifier(class_weight={0:1, 1:4}),
-        #"DTC": DecisionTreeClassifier(),
-        #"RFC": RandomForestClassifier(class_weight={0:1, 1:4}),
-        #"GNB": GaussianNB(),
-        #"Bagging": BaggingClassifier(), # base_estimator=KNeighborsClassifier()
-        #"Extra": ExtraTreesClassifier(class_weight={0:1, 1:4}, max_depth=None),
-        "CatBoost": CatBoostClassifier(silent=True, scale_pos_weight=4)
+        "LGBMC": LGBMClassifier(),
+        "DTC": DecisionTreeClassifier(),
+        "RFC": RandomForestClassifier(),
+        "GNB": GaussianNB(),
+        "Bagging": BaggingClassifier(), # base_estimator=KNeighborsClassifier()
+        "Extra": ExtraTreesClassifier(max_depth=None),
+        "CatBoost": CatBoostClassifier(silent=True)
     }
-
-    def __init__(self, data, target):
+    
+    def __init__(self, data, keep_cols, target, online=False, verbose=True):
         """ construction of Classifier class 
         """
         self.data = data
         self.target = target
-        self.split_x_and_y()
-        self.not_categorical_target = all(data[data[target].notnull()][target].apply(lambda x: isinstance(x, (int, float, complex)) and not isinstance(x, bool)))
+        self.keep_cols = keep_cols
+        self.split_x_and_y(verbose) 
+        self.not_categorical_target = all(data[data[target].notnull()][target].apply(lambda x: str(x).isnumeric() | isinstance(x, (int, float))))
         if self.not_categorical_target:
             self.labels = [(int(i)) for i in sorted(data[target].unique().tolist())]
         else:
             self.le = LabelEncoder()
             self.encoded_y = self.le.fit_transform(self.y)
-            print("Categorical target is label encoded:", pd.Series(self.encoded_y).unique())
+            if verbose:
+                print("Categorical target is label encoded:", pd.Series(self.encoded_y).unique())
             self.labels = self.le.classes_
-        print("Classifier initialized with labels:", self.labels)
+        if verbose:
+            print("Classifier initialized with labels:", self.labels)
+        self.online_run = online
+        if self.online_run:
+            self.run = Run.get_context()
 
-    def split_x_and_y(self):
+    def split_x_and_y(self, verbose=True):
         """ split target from the data 
         """
-        self.features = sorted(list(set(self.data.columns.tolist()) - set([self.target])))
-        print("Training will be done using the following features:\n", self.features)
+        self.features = list(set(self.data.columns.tolist()) - set(self.keep_cols) - set([self.target]))
+        if verbose:
+            print("Training will be done using the following features:\n", self.features)
         self.X = self.data[self.features].copy()
         self.y = self.data[self.target].copy()
-        print("Data is split into X and y:\n",
-              "\tX:", self.X.shape, "\n",
-              "\ty:", self.y.shape)
+        if verbose:
+            print("Data is split into X and y:\n",
+                "\tX:", self.X.shape, "\n",
+                "\ty:", self.y.shape)
 
     def generate_train_test(self):
         """ create train test sets for modeling
@@ -156,42 +165,63 @@ class Classifier:
         if not self.not_categorical_target:
             y = self.encoded_y.copy()
         preds = cross_val_predict(model, self.X, y, cv=cv)  
+        self.model = model
         scores = {}
         scores["accuracy"] = round(accuracy_score(y, preds, normalize=True), 3)
         scores["recall"] = round(recall_score(y, preds, average=score), 3)
         scores["precision"] = round(precision_score(y, preds, average=score), 3) 
         scores["f1_score"] = round(f1_score(y, preds, average=score), 3) 
+        if not self.not_categorical_target:
+            self.pred_test = self.le.inverse_transform(self.pred_test)  
         if confusion:
             self.apply_confusion_matrix(y, preds)    
         return scores
 
-    def apply_confusion_matrix(self, y, preds):
-        """ confusion matrix of the classification 
-        """      
-        labels = self.labels
+    def probability_prediction(self, model, cv=5):
+        """ do a cross validation predictions with probabilities
+        """
+        if model == "lr":
+            model = LogisticRegression()
+        elif model == "best":
+            model = self.best_model
+        elif model == "stack":
+            model = self.stacking_model()
+        elif model == "vote":
+            model = self.voting_model()
+        y = self.y.copy()
         if not self.not_categorical_target:
-            labels = self.le.transform(self.labels)
-        cf_matrix = confusion_matrix(y, preds, labels=labels)
+            y = self.encoded_y.copy()
+        return cross_val_predict(model, self.X, y, cv=cv, method='predict_proba')
+
+    def apply_confusion_matrix(self, name=""):
+        """ confusion matrix of the classification 
+        """        
+        cf_matrix = confusion_matrix(self.y, self.pred_test, labels=self.labels)
         cf_matrix_percentage = cf_matrix.astype('float') / cf_matrix.sum(axis=1)[:, np.newaxis] 
-        fig_unit_size = len(labels)           
-        sns.set(rc={'figure.figsize':(fig_unit_size*1.5, fig_unit_size*3)})
-        fig, axs = plt.subplots(nrows=2)
+        fig_unit_size = len(self.labels)           
+        sns.set(rc={'figure.figsize':(fig_unit_size*5, fig_unit_size*2)})
+        fig, axs = plt.subplots(ncols=2)
         fig.suptitle(f"Confusion Matrix", fontsize=20)
         g1 = sns.heatmap(cf_matrix, annot=True, fmt='g', cmap='Blues', ax=axs[0])
         g2 = sns.heatmap(cf_matrix_percentage, annot=True, fmt='.1%', cmap='Blues', ax=axs[1])
         g1.set_xlabel('Predicted Values')
         g1.set_ylabel('Actual Values ')
-        g1.xaxis.set_ticklabels(labels)
-        g1.yaxis.set_ticklabels(labels)
-        g1.set_xticklabels(g1.get_xticklabels(), rotation=30)
-        g1.set_yticklabels(g1.get_xticklabels(), rotation=0)
+        g1.xaxis.set_ticklabels(self.labels)
+        g1.yaxis.set_ticklabels(self.labels)
+        #g1.set_xticklabels(g1.get_xticklabels(), rotation=30)
+        #g1.set_yticklabels(g1.get_xticklabels(), rotation=0)
         g2.set_xlabel('Predicted Values')
         g2.set_ylabel('Actual Values ')
-        g2.xaxis.set_ticklabels(labels)
-        g2.yaxis.set_ticklabels(labels)
-        g2.set_xticklabels(g2.get_xticklabels(), rotation=30)
-        g2.set_yticklabels(g2.get_xticklabels(), rotation=0)
+        g2.xaxis.set_ticklabels(self.labels)
+        g2.yaxis.set_ticklabels(self.labels)
+        #g2.set_xticklabels(g2.get_xticklabels(), rotation=30)
+        #g2.set_yticklabels(g2.get_xticklabels(), rotation=0)
         plt.show()
+        # save figure if on cloud
+        if self.online_run:
+            filename=f'./outputs/confusion_matrix_{name}.png'
+            plt.savefig(filename, dpi=600)
+            plt.close()
 
     def define_base_models(self, base_list):
         """ give a list of model abbreviations to be used
@@ -240,6 +270,25 @@ class Classifier:
         model.fit(self.X, y)
         print("Model is fit on whole data!")
         self.trained_model = model
+
+    def explain_model_with_shap(self, model=None):
+        """ show SHAP values to explain the output of the regression model
+        """
+        if model is None:
+            if hasattr(self, 'model'): 
+                model = self.model
+            else:
+                raise AssertionError("Please pass over a model to proceed!")
+        # fit the model
+        self.train_model(model)
+        # set important features
+        importances = model.feature_importances_
+        sorted_idx = importances.argsort()[(-1*self.X.shape[1]):]
+        important_features = self.X.columns[sorted_idx].tolist() 
+        # get shap summary plot
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(self.X)
+        shap.summary_plot(shap_values, self.X, feature_names = important_features)
 
     def predict_test(self, test):
         """ train the given classification model on whole data

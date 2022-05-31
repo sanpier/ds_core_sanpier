@@ -7,8 +7,8 @@ import re
 import seaborn as sns
 import warnings
 from azureml.core import Run
-from utils.regressor_utils import Regressor
-from utils.classifier_utils import Classifier
+from regressor_utils import Regressor
+from classifier_utils import Classifier
 from lightgbm import LGBMRegressor, LGBMClassifier
 from lofo import LOFOImportance, Dataset, plot_importance
 from sklearn.decomposition import PCA
