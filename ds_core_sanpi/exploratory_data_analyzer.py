@@ -73,6 +73,47 @@ class EDA_Preprocessor:
         if self.online_run:
             self.run = Run.get_context()
 
+    ### ENGINEER DATA ###
+    def align_cols(self, cols):
+        """ align the dataframe with columns given 
+        """
+        list_of_cols = list(set(cols)-set(self.df.columns.tolist()))
+        print("Data is filled with following zero columns:\n", list_of_cols)
+        for i in list_of_cols:
+            self.df[i] = 0
+        self.df = self.df[cols]
+        print("Shape after alignment:", self.df.shape)
+
+    def pca_decomposition(self, number_of_pc=-1, name=""):
+        """ PCA decomposition of the data using only the numeric features
+        """
+        if self.target != "": 
+            pc_size = number_of_pc 
+            if number_of_pc == -1:
+                pc_size = int(math.sqrt(len(self.numeric_cols)))
+            pca = PCA(n_components=pc_size)
+            principalComponents = pca.fit_transform(self.df[self.numeric_cols])
+            pc_columns = ['pc_' + str(i+1) for i in range(pc_size)]
+            principalDf = pd.DataFrame(data = principalComponents, columns = pc_columns)
+            self.df = pd.concat([principalDf, self.df[self.target]], axis = 1)
+            print("Size of the new data:", self.df.shape)
+            # explained variance in PCA by plot
+            exp_var = pca.explained_variance_ratio_.round(3)
+            sns.set(rc={'figure.figsize':(2.5*math.sqrt(pc_size), 1.5*math.sqrt(pc_size))})
+            sns.barplot(y=exp_var, x=pc_columns)
+            plt.show()
+            if self.online_run:
+                # save figure
+                filename=f'./outputs/pca_decomposition_explained_variance_{name}.png'
+                plt.savefig(filename, dpi=600)
+                plt.close()
+            print("Explained variance in PCA:\n", exp_var,
+                "\nTotal variance explained:", sum(exp_var).round(3))
+            return pca
+        else:
+            raise AssertionError("Please set a target feature first!")
+
+    ### IMPUTATION FUNTIONS & FILL MISSING VALUES ###
     def fill_missing_values(self, fill_by_zero_cols=None, strategy="mean"):
         """ fill missing numeric values by mean and categorical features 
             with 'Unknown' 
@@ -209,33 +250,7 @@ class EDA_Preprocessor:
         gc.collect()
         del df_copy
 
-    def align_cols(self, cols):
-        """ align the dataframe with columns given 
-        """
-        list_of_cols = list(set(cols)-set(self.df.columns.tolist()))
-        print("Data is filled with following zero columns:\n", list_of_cols)
-        for i in list_of_cols:
-            self.df[i] = 0
-        self.df = self.df[cols]
-        print("Shape after alignment:", self.df.shape)
-
-    def reg_plot(self, col, name=""):
-        """ relationship btw. target and given column
-        """
-        if self.target != "": 
-            plt.figure(figsize=(15, 12))
-            ax = sns.regplot(x=self.df[col], y=self.df[self.target], order=2)
-            ax.set_xlabel(f'given column: {col}')
-            ax.set_ylabel(f'target value: {self.target}')
-            plt.show()
-            if self.online_run:
-                # save figure
-                filepath=f'./outputs/reg_plot_of_{col}_{name}.png'
-                plt.savefig(filepath, dpi=600)
-                plt.close() 
-        else:
-            raise AssertionError("Please set a target feature first!")
-
+    ### HANDLE CATEGORICAL FEATURES ###
     def target_encoding_on_column(self, col, value_threshold):
         """ target encode the given categorical column 
         """
@@ -278,6 +293,7 @@ class EDA_Preprocessor:
         self.df = self.df.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
         print("Shape after dummification:", self.df.shape)
 
+    ### TRANSFORMATION FUNCTIONS ###
     def power_transformation(self):
         """ do power transformation on the numeric columns to handle skewness 
             of the data and make it more closer to normal distribution
@@ -310,6 +326,7 @@ class EDA_Preprocessor:
         print("Skewness:")
         print(self.df[self.transform_cols].skew().sort_values(ascending=False))
     
+    ### DISTRIBUTION PLOTS ###
     def distribution_columns(self, cols, name=""):
         """ show boxplot, density plot and histogram distribution
             of selected columns in dataframe 
@@ -344,6 +361,7 @@ class EDA_Preprocessor:
                 plt.savefig(filepath, dpi=600)
                 plt.close() 
 
+    ### CORRELATION FUNCTIONS ###
     def resolve_correlation(self, drop=True):
         """ remove highly correlated features 
         """
@@ -402,35 +420,7 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("Please set a target feature first!")
 
-    def pca_decomposition(self, number_of_pc=-1, name=""):
-        """ PCA decomposition of the data using only the numeric features
-        """
-        if self.target != "": 
-            pc_size = number_of_pc 
-            if number_of_pc == -1:
-                pc_size = int(math.sqrt(len(self.numeric_cols)))
-            pca = PCA(n_components=pc_size)
-            principalComponents = pca.fit_transform(self.df[self.numeric_cols])
-            pc_columns = ['pc_' + str(i+1) for i in range(pc_size)]
-            principalDf = pd.DataFrame(data = principalComponents, columns = pc_columns)
-            self.df = pd.concat([principalDf, self.df[self.target]], axis = 1)
-            print("Size of the new data:", self.df.shape)
-            # explained variance in PCA by plot
-            exp_var = pca.explained_variance_ratio_.round(3)
-            sns.set(rc={'figure.figsize':(2.5*math.sqrt(pc_size), 1.5*math.sqrt(pc_size))})
-            sns.barplot(y=exp_var, x=pc_columns)
-            plt.show()
-            if self.online_run:
-                # save figure
-                filename=f'./outputs/pca_decomposition_explained_variance_{name}.png'
-                plt.savefig(filename, dpi=600)
-                plt.close()
-            print("Explained variance in PCA:\n", exp_var,
-                "\nTotal variance explained:", sum(exp_var).round(3))
-            return pca
-        else:
-            raise AssertionError("Please set a target feature first!")
-
+    ### PERFORMANCE METRICS & PLOTS ###
     def regression_metrics(self, col1, col2):
         """ show metrics for selected two continuous columns to be
             compared with each other 
@@ -445,6 +435,23 @@ class EDA_Preprocessor:
         print("R2 Score:", R2)
         print("Mean Squared Log Error:", LOG)
         print("Mean Absolute Percentage Error:", MAPE)
+
+    def reg_plot(self, col, name=""):
+        """ relationship btw. target and given column
+        """
+        if self.target != "": 
+            plt.figure(figsize=(15, 12))
+            ax = sns.regplot(x=self.df[col], y=self.df[self.target], order=2)
+            ax.set_xlabel(f'given column: {col}')
+            ax.set_ylabel(f'target value: {self.target}')
+            plt.show()
+            if self.online_run:
+                # save figure
+                filepath=f'./outputs/reg_plot_of_{col}_{name}.png'
+                plt.savefig(filepath, dpi=600)
+                plt.close() 
+        else:
+            raise AssertionError("Please set a target feature first!")
 
     def how_close_two_continious_features_are(self, col1, col2, lower_threshold, higher_threshold, res=0.05):
         """ show histogram distribution of the ratio between
@@ -475,6 +482,7 @@ class EDA_Preprocessor:
         # merge ratio data with self.data
         return pd.merge(self.df, df_ratio, left_index=True, right_index=True)
 
+    ### SPLIT DATA & FEATURE IMPORTANCE ###
     def split_x_and_y(self):
         """ split target from the data 
         """
@@ -603,7 +611,7 @@ class EDA_Preprocessor:
             raise AssertionError("Please set a target feature first!")
     
 
-# functions out of the class
+### AUXILIARY FUNCTIONS ###
 def evaluate(x):
     """ evaluation intervals of the residual ratio between
         two continious features
