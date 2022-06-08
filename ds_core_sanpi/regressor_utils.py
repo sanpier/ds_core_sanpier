@@ -478,18 +478,13 @@ class Regressor:
 
     def postprocessing_quantile_regression(self, results, lowest_col, highest_col, interval_col, threshold_interval): 
         """ quantile regression postprocessing """       
-        # swap lowest and highest predictions if lowest > highest 
-        condition = (results[lowest_col] > results[highest_col])
-        temp = results.loc[condition, lowest_col]
-        results.loc[condition, lowest_col] = results.loc[condition, highest_col]
-        results.loc[condition, highest_col] = temp
-        # force predictions btw. lowest and highest
-        condition = (results[lowest_col] > results["best_prediction"]) | (results["best_prediction"] > results[highest_col]) 
-        results.loc[condition, "best_prediction"] = ((results.loc[condition, highest_col] + results.loc[condition, lowest_col]) / 2).round()
-        # if predictions lie within an interval less than threshold  
-        condition = results[interval_col] <= threshold_interval
-        results.loc[condition, lowest_col] = results.loc[condition, "best_prediction"] - threshold_interval/2
-        results.loc[condition, highest_col] = results.loc[condition, "best_prediction"] + threshold_interval/2
+        # conditions to change interval predictions 
+        condition1 = (results[lowest_col] > results[highest_col])
+        condition2 = (results[lowest_col] > results["best_prediction"]) | (results["best_prediction"] > results[highest_col]) 
+        condition3 = results[interval_col] <= threshold_interval
+        cond = condition1 | condition2 | condition3
+        results.loc[cond, lowest_col] = results.loc[cond, "best_prediction"] - threshold_interval/2
+        results.loc[cond, highest_col] = results.loc[cond, "best_prediction"] + threshold_interval/2
         results[interval_col] = results[highest_col] - results[lowest_col]
         return results
         
