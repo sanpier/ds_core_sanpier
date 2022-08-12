@@ -65,7 +65,7 @@ class Regressor:
     def generate_train_test(self):
         """ create train test sets for modeling
         """
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=0.3, random_state=0, shuffle=True)
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=0.3, random_state=42, shuffle=True)
         print("Train data size:", self.X_train.shape)
         print("Test data size:", self.X_test.shape)
 
@@ -76,6 +76,8 @@ class Regressor:
         if hasattr(self, 'X_train'): 
             over = SMOTE(k_neighbors=k)
             self.X_train, self.y_train = over.fit_resample(self.X_train, self.y_train)
+            self.X = self.X_train.copy()
+            self.y = self.y_train.copy()
             print("After oversampling:\n",
                   "\tX_train:", self.X_train.shape, "\n",
                   "\ty_train:", self.y_train.shape, "\n")            
@@ -110,6 +112,12 @@ class Regressor:
             df_train = pd.concat([df_train, df_train_syntetic]).reset_index(drop=True)
             self.X_train = df_train[self.features].copy()
             self.y_train = df_train[self.target].copy()
+            self.X = self.X_train.copy()
+            self.y = self.y_train.copy()
+
+            print("After randomized smoothing:\n",
+                  "\tTrain data size:", self.X_train.shape, "\n",
+                  "\tTrain target distribution:\n", self.y_train.shape, "\n")   
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
@@ -174,7 +182,7 @@ class Regressor:
             model = self.voting_model()
         self.pred_test = cross_val_predict(model, self.X, self.y, cv=cv) 
         self.model = model
-        y =  self.y.copy()
+        y = self.y.copy()
         pred_test = self.pred_test.copy()
         if ratio_reg:            
             pred_test = self.X[calc_col] / pred_test
@@ -204,16 +212,18 @@ class Regressor:
             elif model == "vote":
                 model = self.voting_model()
             model.fit(self.X_train, self.y_train)
-            preds = model.predict(self.X_test)
-            y_test =  self.y_test.copy()
+            self.pred_test = model.predict(self.X_test)
+            self.model = model
+            y_test = self.y_test.copy()
+            pred_test = self.pred_test.copy()
             if ratio_reg:            
-                preds = self.X_test[calc_col] / preds
+                pred_test = self.X_test[calc_col] / pred_test
                 y_test = self.X_test[calc_col] / y_test
             scores = {}
-            scores["MAE"] = round(mean_absolute_error(y_test, preds), 3)  
-            scores["RMSE"] = round(mean_squared_error(y_test, preds, squared=False), 3) 
-            scores["R2"] = round(r2_score(y_test, preds), 3)    
-            scores["MAPE"] = round(mean_absolute_percentage_error(y_test, preds), 3) 
+            scores["MAE"] = round(mean_absolute_error(y_test, pred_test), 3)  
+            scores["RMSE"] = round(mean_squared_error(y_test, pred_test, squared=False), 3) 
+            scores["R2"] = round(r2_score(y_test, pred_test), 3)    
+            scores["MAPE"] = round(mean_absolute_percentage_error(y_test, pred_test), 3) 
             return scores             
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")

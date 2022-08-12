@@ -27,10 +27,10 @@ class EDA_Preprocessor:
         """ construction of EDA_Preprocessor class 
         """
         # fix column names
-        data = data.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
-        keep_cols = [re.sub('[^A-Za-z0-9_]+', '', i) for i in keep_cols]
-        drop_cols = [re.sub('[^A-Za-z0-9_]+', '', i) for i in drop_cols]
-        target_col = re.sub('[^A-Za-z0-9_]+', '', target_col)
+        data = data.rename(columns = lambda x: standardize_column_name(x))
+        keep_cols = [standardize_column_name(i) for i in keep_cols]
+        drop_cols = [standardize_column_name(i) for i in drop_cols]
+        target_col = standardize_column_name(target_col)
         # target 
         self.target = target_col
         # problem
@@ -59,7 +59,7 @@ class EDA_Preprocessor:
              f"\tCategorical features: {len(self.categorical_cols)}\n",
              f"\tBoolean features: {len(self.bool_cols)}")
         # set transformation columns: not boolean ones, target neither the binary ones
-        self.transform_cols = list(set(self.numeric_cols) - set(self.bool_cols + data.columns[data.isin([0,1]).all()].tolist()))
+        self.transform_cols = list(set(self.numeric_cols) - set(self.bool_cols + data.columns[data.isin([0,1,np.nan]).all()].tolist()))
         # set the final columns and data
         if self.target != "": 
             all_cols = keep_cols + sorted(self.numeric_cols) + sorted(self.bool_cols) + sorted(self.categorical_cols) + [self.target]
@@ -114,6 +114,21 @@ class EDA_Preprocessor:
             raise AssertionError("Please set a target feature first!")
 
     ### IMPUTATION FUNTIONS & FILL MISSING VALUES ###
+    def replace_inf_values(self):
+        """ get rid of inf values 
+        """
+        df = self.df[self.numeric_cols]
+        count = np.isinf(df).values.sum()
+        print("Infinity values total count: ", count)
+        col_name = df.columns.to_series()[np.isinf(df).any()]
+        print("Infinity value columns: ")
+        for i in col_name:
+            print(f"\tfixing column {i}:", np.isinf(df[col_name]).values.sum())
+            max_value = self.df[~self.df[i].isin([np.inf])][i].max()
+            min_value = self.df[~self.df[i].isin([-np.inf])][i].min()
+            self.df[i] = np.where(self.df[i].isin([np.inf]), max_value, self.df[i]) 
+            self.df[i] = np.where(self.df[i].isin([-np.inf]), min_value, self.df[i]) 
+            
     def fill_missing_values(self, fill_by_zero_cols=None, strategy="mean"):
         """ fill missing numeric values by mean and categorical features 
             with 'Unknown' 
@@ -145,6 +160,9 @@ class EDA_Preprocessor:
     def fill_given_col_by_mode_row(self, row, fill_col, by_mode_col):
         """ fill column by other column's mode per row
         """
+        if self.df[self.df[fill_col].isna()].shape[0] == 0:
+            print(f"Column {fill_col} is already full!")
+            return
         if (row[fill_col] == None) | (not row[fill_col]) | (row[fill_col] != row[fill_col]):
             df_ = self.df[self.df[by_mode_col] == row[by_mode_col]]
             if df_.shape[0] > 0:
@@ -182,16 +200,20 @@ class EDA_Preprocessor:
 
     def impute_with_classification(self, col):
         """ fill missing numeric values in given columns with a
-            regression model
+            classification model
         """
+        if self.df[self.df[col].isna()].shape[0] == 0:
+            print(f"Column {col} is already full!")
+            return
         df_copy = self.df.copy()
+        df_copy.drop(columns=self.target, axis=1, inplace=True)
         categoric_cols = list(set(self.categorical_cols) - set([col]))
         if len(categoric_cols) > 0:
             # filling categorical cols with unknown class
             df_copy[categoric_cols] = df_copy[categoric_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
             # dummification
             df_copy = pd.get_dummies(df_copy, columns=categoric_cols)
-            df_copy = df_copy.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
+            df_copy = df_copy.rename(columns = lambda x: standardize_column_name(x))
         # choose columns to do modeling 
         features = list(set(df_copy.columns[df_copy.notnull().all()]) - set(self.keep_cols))
         df_copy = df_copy[features + [col]]
@@ -219,15 +241,19 @@ class EDA_Preprocessor:
 
     def impute_with_regression(self, col):
         """ fill missing numeric values in given columns with a
-            classification model
+            regression model
         """
+        if self.df[self.df[col].isna()].shape[0] == 0:
+            print(f"Column {col} is already full!")
+            return
         df_copy = self.df.copy()
+        df_copy.drop(columns=self.target, axis=1, inplace=True)
         if len(self.categorical_cols) > 0:
             # filling categorical cols with unknown class
             df_copy[self.categorical_cols] = df_copy[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
             # dummification
             df_copy = pd.get_dummies(df_copy, columns=self.categorical_cols)
-            df_copy = df_copy.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
+            df_copy = df_copy.rename(columns = lambda x: standardize_column_name(x))
         # choose columns to do modeling 
         features = list(set(df_copy.columns[df_copy.notnull().all()]) - set(self.keep_cols))
         df_copy = df_copy[features + [col]]
@@ -266,31 +292,40 @@ class EDA_Preprocessor:
     def target_encoding(self, category_threshold, value_threshold, all_of_them=False):
         """ target encode all categorical columns 
         """
-        if all_of_them==False:
-            # dummifiction
-            dummy_cols = [col for col in self.categorical_cols if len(self.df[col].unique()) <= category_threshold]
-            print("Dummfying ones with less than category threshold:", len(dummy_cols), "\n", dummy_cols)
-            self.df = pd.get_dummies(self.df, columns=dummy_cols)
-            self.df = self.df.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
-            # target encoding
-            target_cols = list(set(self.categorical_cols) - set(dummy_cols))
-            print("Selected categorical ones are now under the process of target encoding:", len(target_cols))
-            for category_col in target_cols:
-                self.target_encoding_on_column(category_col, value_threshold)
-                print(category_col, "is target encoded now!")
+        if self.problem == "regression":
+            if all_of_them==False:
+                # dummifiction
+                dummy_cols = [col for col in self.categorical_cols if len(self.df[col].unique()) <= category_threshold]
+                print("Dummfying ones with less than category threshold:", len(dummy_cols), "\n", dummy_cols)
+                self.df = pd.get_dummies(self.df, columns=dummy_cols)
+                self.df = self.df.rename(columns = lambda x: standardize_column_name(x))
+                # target encoding
+                target_cols = list(set(self.categorical_cols) - set(dummy_cols))
+                print("Selected categorical ones are now under the process of target encoding:", len(target_cols))
+                for category_col in target_cols:
+                    self.target_encoding_on_column(category_col, value_threshold)
+                    print(category_col, "is target encoded now!")
+            else:
+                # target encode all
+                print("All categorical ones are now under the process of target encoding:", len(self.categorical_cols))
+                for category_col in self.categorical_cols:
+                    self.target_encoding_on_column(category_col, value_threshold)
+                    print(category_col, "is target encoded now!")
         else:
-            # target encode all
-            print("All categorical ones are now under the process of target encoding:", len(self.categorical_cols))
-            for category_col in self.categorical_cols:
-                self.target_encoding_on_column(category_col, value_threshold)
-                print(category_col, "is target encoded now!")
+            raise AssertionError("The classification problem is not applicable for target encoding!")
 
-    def dummification(self):
+    def dummification(self, value_threshold=1000):
         """ get into dummy cols out of categorical features 
         """
         print("Shape before dummification:", self.df.shape)
-        self.df = pd.get_dummies(self.df, columns=self.categorical_cols)
-        self.df = self.df.rename(columns = lambda x: re.sub('[^A-Za-z0-9_]+', '', x))
+        # generate dummies
+        for cat_col_i in self.categorical_cols:
+            cats = self.df[cat_col_i].value_counts()[lambda x: x > value_threshold].index
+            df_cat_col_dummified = pd.get_dummies(pd.Categorical(self.df[cat_col_i], categories=cats)).rename(columns = lambda x: str(f"{cat_col_i}_{x}").lower())
+            self.df = pd.concat([self.df, df_cat_col_dummified], axis=1, join='inner')
+        # drop categorical columns and standardize new dummy column names
+        self.df.drop(columns=self.categorical_cols, axis=1, inplace=True)
+        self.df = self.df.rename(columns = lambda x: standardize_column_name(x))
         print("Shape after dummification:", self.df.shape)
 
     ### TRANSFORMATION FUNCTIONS ###
@@ -302,14 +337,7 @@ class EDA_Preprocessor:
         self.df[self.transform_cols] = pd.DataFrame(data = power.fit_transform(self.df[self.transform_cols]), columns=self.transform_cols)   
         print("Power transformation is done on the following numeric columns: total = ", len(self.transform_cols), 
               "\n", self.transform_cols)     
-        return power
-
-    def apply_power_transformer(self, transformer):
-        """ do power transformation given a transformer object 
-        """  
-        self.df[self.transform_cols] = pd.DataFrame(data = transformer.transform(self.df[self.transform_cols]), columns=self.transform_cols)   
-        print("Power transformation object is used to transform the following numeric columns: total = ", len(self.transform_cols), 
-              "\n", self.transform_cols)     
+        return power 
 
     def standardizer(self):
         """ do standardization on the numeric columns
@@ -320,6 +348,13 @@ class EDA_Preprocessor:
               "\n", self.transform_cols)     
         return scaler
 
+    def apply_transformer(self, transformer):
+        """ apply transformation given a transformer object 
+        """  
+        self.df[self.transform_cols] = pd.DataFrame(data = transformer.transform(self.df[self.transform_cols]), columns=self.transform_cols)   
+        print("Transformation object is used to transform the following numeric columns: total = ", len(self.transform_cols), 
+              "\n", self.transform_cols)    
+              
     def show_skewness(self):
         """ calculate and print skewness of all transformation columns 
         """
@@ -404,19 +439,35 @@ class EDA_Preprocessor:
             wrt. to target feature
         """
         if self.target != "": 
-            for col in cols:
-                sns.set(rc={'figure.figsize':(6, 5)})
-                ax = sns.catplot(x=col, y=self.target, kind="bar", data=self.df)
-                ax.fig.suptitle(f"Correlation plot of: {col} to {self.target}", fontsize=20, y=1.05)
-                if rotate:
-                    ax.set_xticklabels(rotation=30)
-                print(self.df.groupby(col)[self.target].mean())
-                plt.show()
-                if self.online_run:
-                    # save figure
-                    filename=f'./outputs/categorical_correlation_{col}_{name}.png'
-                    plt.savefig(filename, dpi=600)
-                    plt.close()
+            if self.problem == "regression":
+                for col in cols:
+                    sns.set(rc={'figure.figsize':(6, 5)})
+                    ax = sns.catplot(x=col, y=self.target, kind="bar", data=self.df)
+                    ax.fig.suptitle(f"Correlation plot of: {col} to {self.target}", fontsize=20, y=1.05)
+                    if rotate:
+                        ax.set_xticklabels(rotation=30)
+                    print(self.df.groupby(col)[self.target].mean())
+                    plt.show()
+                    if self.online_run:
+                        # save figure
+                        filename=f'./outputs/categorical_correlation_{col}_{name}.png'
+                        plt.savefig(filename, dpi=600)
+                        plt.close()
+            elif self.problem == "classification":
+                for col in cols:
+                    for unique_val in self.df[col].unique().tolist():
+                        value_counts = self.df[self.df[col] == unique_val][self.target].value_counts(normalize=True)
+                        sns.set(rc={'figure.figsize':(6, 5)})
+                        ax = sns.catplot(x=value_counts.index, y=value_counts.values, kind="bar", data=self.df)
+                        ax.fig.suptitle(f"Correlation plot of: {col} of {unique_val}", fontsize=20, y=1.05)
+                        if rotate:
+                            ax.set_xticklabels(rotation=30)
+                        plt.show()
+                        if self.online_run:
+                            # save figure
+                            filename=f'./outputs/categorical_correlation_of_{col}_in_{unique_val}.png'
+                            plt.savefig(filename, dpi=600)
+                            plt.close()
         else:
             raise AssertionError("Please set a target feature first!")
 
@@ -459,19 +510,25 @@ class EDA_Preprocessor:
             that wanted to be same in ideal case 
         """
         # take the ratio
-        ratio = self.df[col1] / self.df[col2]
-        ratio = ratio[(ratio > lower_threshold) & (ratio < higher_threshold)]
-        print(f"{len(ratio)} of the entries are within given ratio threshold {lower_threshold} - {higher_threshold}")
-        # evaluate
-        df_ratio = pd.DataFrame({"ratio": ratio})
-        df_ratio["evaluation"] = df_ratio["ratio"].apply(evaluate)
-        print("Distribution according to the errors:")
-        print(df_ratio["evaluation"].value_counts())
+        df_ratio = self.df.copy()
+        df_ratio["error"] = df_ratio[col1] - df_ratio[col2]
+        df_ratio["percentage_error"] = df_ratio["error"]/df_ratio[col2] 
+        df_ratio["abs_percentage_error"] = round(100*(np.absolute(df_ratio["percentage_error"])), 1) 
         # regression metrics
-        self.regression_metrics(col1, col2)
+        print("Regression metrics:")
+        self.regression_metrics(col1, col2)    
+        # take the ratio
+        df_ratio["ratio"] = df_ratio[col1] / df_ratio[col2]
+        df_ratio_ = df_ratio[(df_ratio["ratio"] > lower_threshold) & (df_ratio["ratio"] < higher_threshold)]
+        # counts of observation in different absolute percentage errors
+        percentage_errors = [5, 10, 15, 25, 50]
+        print("\nNumber of observations wrt. absolute percentage errors:")
+        [print(f'<={val}%:', df_ratio[df_ratio["abs_percentage_error"] <= val].shape[0]) for val in percentage_errors]
+        # set evaluation criteria based on absolute percentage errors
+        df_ratio["evaluation"] = df_ratio["abs_percentage_error"].apply(evaluate)
         # histogram distribution
         plt.figure(figsize=(12, 9))
-        sns.histplot(data=df_ratio, x="ratio", hue="evaluation", binwidth=res,
+        sns.histplot(data=df_ratio.iloc[df_ratio_.index], x="ratio", hue="evaluation", binwidth=res,
                      palette={"5%":  "#205072", 
                               "10%": "#33709c", 
                               "15%": "#329D9C",
@@ -479,8 +536,8 @@ class EDA_Preprocessor:
                               "50%": "#7BE495",
                               "off": "#CFF4D2"}, hue_order = ["5%", "10%", "15%", "25%", "50%", "off"])
         plt.show()
-        # merge ratio data with self.data
-        return pd.merge(self.df, df_ratio, left_index=True, right_index=True)
+        # return data
+        return df_ratio
 
     ### SPLIT DATA & FEATURE IMPORTANCE ###
     def split_x_and_y(self):
@@ -629,3 +686,13 @@ def evaluate(x):
     if (x <= 5):
         value = "5%"
     return value
+
+def standardize_column_name(x):
+    """ standardize given column string 
+    """
+    x = str(x).replace(" ", "_")
+    x = re.sub("ä","ae", x)
+    x = re.sub("ö","oe", x)
+    x = re.sub("ü","ue", x)
+    x = re.sub("ß","ss", x)
+    return re.sub('[^A-Za-z0-9_]+', '', x)
