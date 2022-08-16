@@ -13,26 +13,28 @@ from lightgbm import LGBMRegressor
 from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_squared_log_error, mean_absolute_percentage_error
 from sklearn.model_selection import cross_val_predict, train_test_split
-from sklearn.linear_model import LinearRegression, Lasso
+from sklearn.neighbors import KNeighborsRegressor
+from sklearn.linear_model import LinearRegression, Lasso, Ridge
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.svm import SVR
-from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, BaggingRegressor, StackingRegressor, VotingRegressor
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, BaggingRegressor, StackingRegressor, VotingRegressor
 
 
 class Regressor:
         
     dict_regressors = {
         "LR": LinearRegression(),
-        "Lasso": Lasso(),
-        "SVR_linear": SVR(kernel='linear'),
-        "SVR_poly": SVR(kernel='poly'),
-        "SVR_default": SVR(),
-        "LGBMR": LGBMRegressor(),
-        "DTR": DecisionTreeRegressor(),
-        "RFR": RandomForestRegressor(),
-        "Bagging": BaggingRegressor(),
-        "Extra": ExtraTreesRegressor(),
-        "CatBoost": CatBoostRegressor(loss_function='RMSE', silent=True)
+        "Ridge": Ridge(random_state=42),
+        "Lasso": Lasso(random_state=42),
+        "KNC": KNeighborsRegressor(),
+        "SVR": SVR(), # kernel == 'poly' | 'linear' | 'sigmoid'
+        "GBR": GradientBoostingRegressor(random_state=42),
+        "LGBMR": LGBMRegressor(random_state=42),
+        "DTR": DecisionTreeRegressor(random_state=42),
+        "RFR": RandomForestRegressor(random_state=42),
+        "Bagging": BaggingRegressor(random_state=42),
+        "Extra": ExtraTreesRegressor(random_state=42),
+        "CatBoost": CatBoostRegressor(loss_function='RMSE', silent=True, random_state=42)
     }
 
     def __init__(self, data, keep_cols, target, online=False, verbose=True):
@@ -74,7 +76,7 @@ class Regressor:
         """ oversampling method for imbalanced data
         """
         if hasattr(self, 'X_train'): 
-            over = SMOTE(k_neighbors=k)
+            over = SMOTE(k_neighbors=k, random_state=42)
             self.X_train, self.y_train = over.fit_resample(self.X_train, self.y_train)
             self.X = self.X_train.copy()
             self.y = self.y_train.copy()
@@ -406,7 +408,7 @@ class Regressor:
         """
         df = pd.DataFrame({"ground-truth": self.y})
         for q in quantiles:
-            model = LGBMRegressor(objective = 'quantile', alpha = q)            
+            model = LGBMRegressor(objective = 'quantile', alpha = q, random_state=42)            
             if q == 0.5:
                 scores = self.cv_score_model(model)
                 best_model = model
@@ -421,7 +423,7 @@ class Regressor:
             else:
                 _ = self.cv_score_model(model)
                 df[f"{q}_pred"] = self.pred_test
-                model = LGBMRegressor(objective = 'quantile', alpha = 1-q)            
+                model = LGBMRegressor(objective = 'quantile', alpha = 1-q, random_state=42)            
                 _ = self.cv_score_model(model)
                 df[f"{1-q}_pred"] = self.pred_test 
                 df[f"{q}-{1-q}_interval"] = df[f"{1-q}_pred"] - df[f"{q}_pred"]
@@ -449,16 +451,16 @@ class Regressor:
         df = pd.DataFrame({"ground-truth": self.y})
 
         # for quantile = quantile
-        model = LGBMRegressor(objective = 'quantile', alpha = quantile)            
+        model = LGBMRegressor(objective = 'quantile', alpha = quantile, random_state=42)            
         _ = self.cv_score_model(model)
         df["lowest_prediction"] = self.pred_test.round()
-        model = LGBMRegressor(objective = 'quantile', alpha = 1-quantile)            
+        model = LGBMRegressor(objective = 'quantile', alpha = 1-quantile, random_state=42)            
         _ = self.cv_score_model(model)
         df["highest_prediction"] = self.pred_test.round() 
         df["interval"] = df["highest_prediction"] - df["lowest_prediction"]
   
         # for quantile = 0.5
-        model = LGBMRegressor(objective = 'quantile', alpha = 0.5)            
+        model = LGBMRegressor(objective = 'quantile', alpha = 0.5, random_state=42)            
         scores = self.cv_score_model(model)
         self.model = model   
         df["best_prediction"] = self.pred_test.round()

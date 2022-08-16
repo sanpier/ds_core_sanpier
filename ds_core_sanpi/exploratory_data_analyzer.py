@@ -7,17 +7,21 @@ import re
 import seaborn as sns
 import warnings
 from azureml.core import Run
-from regressor_utils import Regressor
+from category_encoders import TargetEncoder, LeaveOneOutEncoder, WOEEncoder
+from catboost import CatBoostRegressor
 from classifier_utils import Classifier
 from lightgbm import LGBMRegressor, LGBMClassifier
-from lofo import LOFOImportance, Dataset, plot_importance
+from lofo import LOFOImportance, FLOFOImportance, Dataset, plot_importance
+from regressor_utils import Regressor
 from sklearn.decomposition import PCA
-from sklearn.impute import KNNImputer
-from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, GradientBoostingRegressor
+from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier
+from sklearn.experimental import enable_iterative_imputer
+from sklearn.impute import KNNImputer, IterativeImputer
+from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
 from sklearn.metrics import confusion_matrix, make_scorer, accuracy_score, recall_score, precision_score, roc_auc_score, f1_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_squared_log_error, mean_absolute_percentage_error
-from sklearn.model_selection import cross_val_predict
-from sklearn.preprocessing import PowerTransformer, StandardScaler
+from sklearn.model_selection import cross_val_predict, KFold
 warnings.filterwarnings("ignore")
 
 
@@ -112,8 +116,66 @@ class EDA_Preprocessor:
             return pca
         else:
             raise AssertionError("Please set a target feature first!")
+    
+    ### DISTRIBUTION PLOTS ###
+    def check_outliers(self, cols=None):
+        """ check numeric outliers by percentile analysis
+        """   
+        if cols is None:  
+            cols = self.numeric_cols
+        for col in cols:
+            print(col.upper())
+            print("\tStatistical outliers:\t", get_extreme_values(self.df[col]))
+            vfunc = np.vectorize(lambda x: "{:.2f}".format(x))
+            print("\t0-1-5-50-95-99-100 Percentiles:\t", vfunc(np.nanpercentile(self.df[col], [0,1,5,50,95,99,100])))
+
+    def numeric_distributions(self, cols=None, name=""):
+        """ show boxplot, density plot and histogram distribution
+            of selected columns in dataframe 
+        """
+        if cols is None:  
+            cols = self.numeric_cols
+        for col in cols:
+            sns.set(rc={'figure.figsize':(6, 8)})
+            fig, axs = plt.subplots(nrows=3)
+            fig.suptitle(f"Distribution plots of: {col}", fontsize=20, y=0.95)
+            sns.boxplot(data=self.df, x=col, ax=axs[0])
+            sns.kdeplot(data=self.df, x=col, ax=axs[1])
+            sns.histplot(data=self.df, x=col, ax=axs[2], stat="count", discrete=True)
+            plt.show()
+            if self.online_run:
+                # save figure
+                filepath=f'./outputs/distribution_of_{col}_{name}.png'
+                plt.savefig(filepath, dpi=600)
+                plt.close(fig)
+        # check outliers
+        self.check_outliers(cols)
+
+    def count_distributions(self, cols=None, name=""):
+        """ show count plots of given columns in dataframe 
+        """
+        if cols is None:  
+            cols = self.categorical_cols
+        for col in cols:
+            sns.set(rc={'figure.figsize':(6, 5)})
+            sns.countplot(y=col, 
+                          data=self.df, 
+                          palette="Set3", 
+                          order=self.df[col].value_counts().index).set_title(f"Count plot of: {col}", fontsize=20)
+            plt.show()
+            if self.online_run:
+                # save figure
+                filepath=f'./outputs/count_of_{col}_{name}.png'
+                plt.savefig(filepath, dpi=600)
+                plt.close() 
 
     ### IMPUTATION FUNTIONS & FILL MISSING VALUES ###
+    def check_null_features(self, threshold=0):
+        """ check nan values 
+        """
+        nans = self.df.isna().sum()
+        print(nans[nans > threshold].sort_values(ascending=False))
+
     def replace_inf_values(self):
         """ get rid of inf values 
         """
@@ -172,31 +234,26 @@ class EDA_Preprocessor:
         else:
             return row[fill_col]
 
-    def impute_with_knn(self, cols):
-        """ fill missing numeric values in given columns with KNN
+    def impute_all(self, estimator=LGBMRegressor(), missing_values=np.nan, initial_strategy="mean", imputation_order="ascending"):
+        """ fill missing columns by IterativeImputer 
+            + missing_values: int or np.nan
+            + initial_strategy: {"mean", "median", "most_frequent", "constant"}
+            + imputation_order: {"ascending", "descending", "roman", "arabic", "random"}
         """
-        # filling nan values in numeric cols
-        fill_numeric_cols = list(set(self.numeric_cols) - set(cols))
-        self.df[fill_numeric_cols] = self.df[fill_numeric_cols].fillna(
-            self.df[fill_numeric_cols].mean()
-        ).fillna(0)
-        # filling categorical cols with unknown class
-        self.df[self.categorical_cols] = self.df[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
-        # dummification
-        if len(self.categorical_cols) > 0:
-            self.dummification()
-        # split data
-        if not hasattr(self, 'X'): 
-            self.split_x_and_y()
-        # fill cols with knn
-        # define imputer
-        imputer = KNNImputer(n_neighbors=3, weights='distance')
-        # fit on the dataset
-        imputer.fit(self.X)
-        # transform the dataset
-        self.X = imputer.transform(self.X)
-        print("After filling missing values in X data:")
-        print(self.X.isna().sum())
+        categorical_cols = self.df.columns[self.df.dtypes==object].tolist()
+        if len(categorical_cols) == 0:
+            cols = list(set(self.df.columns) - set(self.keep_cols) - set([self.target]))
+            imp_num = IterativeImputer(estimator=estimator, 
+                                       missing_values=missing_values, 
+                                       initial_strategy=initial_strategy,
+                                       imputation_order=imputation_order,
+                                       random_state=0)
+            self.df[cols] = imp_num.fit_transform(self.df[cols])
+            self.imputed_cols = cols
+            self.check_null_features()
+            return imp_num
+        else:
+            raise AssertionError("The data has categorical features, please first handle them!")
 
     def impute_with_classification(self, col):
         """ fill missing numeric values in given columns with a
@@ -222,7 +279,7 @@ class EDA_Preprocessor:
         test_indexes = df_copy[df_copy[col].isnull()].index
         le = LabelEncoder()
         encoded_y = le.fit_transform(df_copy.iloc[train_indexes][col])
-        classifier = LGBMClassifier()
+        classifier = LGBMClassifier(random_state=42)
         # measure how good it is
         preds = cross_val_predict(classifier, df_copy.iloc[train_indexes][features], encoded_y, cv=5)  
         scores = {}
@@ -260,7 +317,7 @@ class EDA_Preprocessor:
         # impute by predictons
         train_indexes = df_copy[df_copy[col].notnull()].index
         test_indexes = df_copy[df_copy[col].isnull()].index
-        regressor = LGBMRegressor()
+        regressor = LGBMRegressor(random_state=42)
         # measure how good it is
         preds = cross_val_predict(regressor, df_copy.iloc[train_indexes][features], df_copy.iloc[train_indexes][col], cv=5) 
         scores = {}
@@ -292,7 +349,7 @@ class EDA_Preprocessor:
     def target_encoding(self, category_threshold, value_threshold, all_of_them=False):
         """ target encode all categorical columns 
         """
-        if self.problem == "regression":
+        if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
             if all_of_them==False:
                 # dummifiction
                 dummy_cols = [col for col in self.categorical_cols if len(self.df[col].unique()) <= category_threshold]
@@ -311,6 +368,21 @@ class EDA_Preprocessor:
                 for category_col in self.categorical_cols:
                     self.target_encoding_on_column(category_col, value_threshold)
                     print(category_col, "is target encoded now!")
+        else:
+            raise AssertionError("The classification problem is not applicable for target encoding!")
+
+    def target_encoding_by_lib(self, method="target"):
+        """ target encoding by category_encoders library
+        """
+        if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
+            if method == "target":
+                encoder = TargetEncoder(handle_missing="return_nan", handle_unknown="return_nan")
+            elif method == "leave_one_out":
+                encoder = LeaveOneOutEncoder(handle_missing="return_nan", handle_unknown="return_nan")
+            elif method == "woe":
+                encoder = WOEEncoder(handle_missing="return_nan", handle_unknown="return_nan")
+            self.df[self.categorical_cols] = encoder.fit_transform(self.df[self.categorical_cols], self.df[self.target])
+            return encoder
         else:
             raise AssertionError("The classification problem is not applicable for target encoding!")
 
@@ -361,41 +433,6 @@ class EDA_Preprocessor:
         print("Skewness:")
         print(self.df[self.transform_cols].skew().sort_values(ascending=False))
     
-    ### DISTRIBUTION PLOTS ###
-    def distribution_columns(self, cols, name=""):
-        """ show boxplot, density plot and histogram distribution
-            of selected columns in dataframe 
-        """
-        for col in cols:
-            sns.set(rc={'figure.figsize':(6, 8)})
-            fig, axs = plt.subplots(nrows=3)
-            fig.suptitle(f"Distribution plots of: {col}", fontsize=20, y=0.95)
-            sns.boxplot(data=self.df, x=col, ax=axs[0])
-            sns.kdeplot(data=self.df, x=col, ax=axs[1])
-            sns.histplot(data=self.df, x=col, ax=axs[2], stat="count", discrete=True)
-            plt.show()
-            if self.online_run:
-                # save figure
-                filepath=f'./outputs/distribution_of_{col}_{name}.png'
-                plt.savefig(filepath, dpi=600)
-                plt.close(fig) 
-
-    def count_columns(self, cols, name=""):
-        """ show count plots of given columns in dataframe 
-        """
-        for col in cols:
-            sns.set(rc={'figure.figsize':(6, 5)})
-            sns.countplot(y=col, 
-                          data=self.df, 
-                          palette="Set3", 
-                          order=self.df[col].value_counts().index).set_title(f"Count plot of: {col}", fontsize=20)
-            plt.show()
-            if self.online_run:
-                # save figure
-                filepath=f'./outputs/count_of_{col}_{name}.png'
-                plt.savefig(filepath, dpi=600)
-                plt.close() 
-
     ### CORRELATION FUNCTIONS ###
     def resolve_correlation(self, drop=True):
         """ remove highly correlated features 
@@ -434,12 +471,14 @@ class EDA_Preprocessor:
             plt.savefig(filename, dpi=600)
             plt.close()
     
-    def categorical_correlation(self, cols, name="", rotate=False):
+    def categorical_correlation(self, cols=None, name="", rotate=False):
         """ show correlation of given categorical features
             wrt. to target feature
         """
+        if cols is None:  
+            cols = self.categorical_cols
         if self.target != "": 
-            if self.problem == "regression":
+            if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
                 for col in cols:
                     sns.set(rc={'figure.figsize':(6, 5)})
                     ax = sns.catplot(x=col, y=self.target, kind="bar", data=self.df)
@@ -453,7 +492,7 @@ class EDA_Preprocessor:
                         filename=f'./outputs/categorical_correlation_{col}_{name}.png'
                         plt.savefig(filename, dpi=600)
                         plt.close()
-            elif self.problem == "classification":
+            else:
                 for col in cols:
                     for unique_val in self.df[col].unique().tolist():
                         value_counts = self.df[self.df[col] == unique_val][self.target].value_counts(normalize=True)
@@ -571,9 +610,9 @@ class EDA_Preprocessor:
                 n_features = self.df.shape[1]
             # define the model
             if self.problem == "classification":
-                model = LGBMClassifier() 
+                model = LGBMClassifier(random_state=42) 
             elif self.problem == "regression":
-                model = LGBMRegressor() 
+                model = LGBMRegressor(random_state=42) 
             # fit the model
             model.fit(self.X, self.y)
             # get importances
@@ -604,7 +643,7 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("Please set a target feature first!")
     
-    def get_lofo_importance(self):
+    def get_lofo_importance(self, classification_score="weighted", fast=False, recursive_check=False, drop=True):
         """ get feature importance by LOFO
         """
         if self.target != "": 
@@ -616,53 +655,64 @@ class EDA_Preprocessor:
             dataset = Dataset(df=df_lofo, target=self.target, features=self.X.columns)
             # define the metric
             if self.problem == "classification":
-                metric='f1_weighted'
+                if classification_score == "weighted":
+                    metric='f1_weighted'
+                elif classification_score == "macro":
+                    metric='f1_macro'
                 score_metric='f1_score'
             elif self.problem == "regression":
                 metric='r2'
                 score_metric='R2'
-            lofo_imp = LOFOImportance(dataset, scoring=metric)
+            if fast:
+                lofo_imp = FLOFOImportance(dataset, scoring=metric)
+            else:
+                lofo_imp = LOFOImportance(dataset, scoring=metric)
             importance_df = lofo_imp.get_importance()
             # plot importance
             plot_importance(importance_df, figsize=(12, 12))
             # find features that needs to be dropped!
-            features = importance_df.feature.iloc[::-1].tolist()
-            # define the model
-            if self.problem == "classification":
-                modeling = Classifier(df_lofo, [], self.target, self.online_run, False)
-                base = modeling.cv_score_model(LGBMClassifier())[score_metric]
-            elif self.problem == "regression":
-                modeling = Regressor(df_lofo, [], self.target, self.online_run, False)
-                base = modeling.cv_score_model(LGBMRegressor())[score_metric]
-            score = 1
-            print("Total features before LOFO:", len(features), "\tBase score:", base)
-            features_to_drop = []
-            while score >= base:
-                feature_to_drop = features[0]
-                print(f"\tDo we drop feature: {feature_to_drop}?")
-                features_ = features[1:]
-                # score it according to problem and model
+            if recursive_check:
+                features = importance_df.feature.iloc[::-1].tolist()
+                # define the model
                 if self.problem == "classification":
-                    modeling = Classifier(df_lofo[features_ + [self.target]], [], self.target, self.online_run, False)
-                    score = modeling.cv_score_model(LGBMClassifier())[score_metric]
+                    modeling = Classifier(df_lofo, [], self.target, self.online_run, False)
+                    base = modeling.cv_score_model(LGBMClassifier(random_state=42), score=classification_score)[score_metric]
                 elif self.problem == "regression":
-                    modeling = Regressor(df_lofo[features_ + [self.target]], [], self.target, self.online_run, False)
-                    score = modeling.cv_score_model(LGBMRegressor())[score_metric]
-                if score >= base:
-                    base = score
-                    print("\tYes since score now is:", score)
-                    features = features[1:]
-                    features_to_drop.append(feature_to_drop)
-                else:
-                    print("\tNo!")            
+                    modeling = Regressor(df_lofo, [], self.target, self.online_run, False)
+                    base = modeling.cv_score_model(LGBMRegressor(random_state=42))[score_metric]
+                score = 1
+                print("Total features before LOFO:", len(features), "\tBase score:", base)
+                features_to_drop = []
+                while score >= base:
+                    feature_to_drop = features[0]
+                    print(f"\tDo we drop feature: {feature_to_drop}?")
+                    features_ = features[1:]
+                    # score it according to problem and model
+                    if self.problem == "classification":
+                        modeling = Classifier(df_lofo[features_ + [self.target]], [], self.target, self.online_run, False)
+                        score = modeling.cv_score_model(LGBMClassifier(random_state=42))[score_metric]
+                    elif self.problem == "regression":
+                        modeling = Regressor(df_lofo[features_ + [self.target]], [], self.target, self.online_run, False)
+                        score = modeling.cv_score_model(LGBMRegressor(random_state=42))[score_metric]
+                    if score >= base:
+                        base = score
+                        print("\tYes since score now is:", score)
+                        features = features[1:]
+                        features_to_drop.append(feature_to_drop)
+                    else:
+                        print("\tNo!")            
+                print("Number of features after LOFO:", len(features), "\tNew score:", base)
+            else:
+                features_to_drop = importance_df[importance_df.importance_mean <= 0].feature.tolist()
             print("Following features are dropped:\t", features_to_drop)
-            print("Total features after LOFO:", len(features), "\tNew score:", base)
-            self.df.drop(features_to_drop, axis=1, inplace=True)
-            self.X.drop(features_to_drop, axis=1, inplace=True)
-            self.numeric_cols = list(set(self.numeric_cols) - set(features_to_drop))
-            self.transform_cols = list(set(self.transform_cols) - set(features_to_drop))
-            self.categorical_cols = list(set(self.categorical_cols) - set(features_to_drop))
-            self.bool_cols = list(set(self.bool_cols) - set(features_to_drop))
+            # drop features
+            if drop:
+                self.df.drop(features_to_drop, axis=1, inplace=True)
+                self.X.drop(features_to_drop, axis=1, inplace=True)
+                self.numeric_cols = list(set(self.numeric_cols) - set(features_to_drop))
+                self.transform_cols = list(set(self.transform_cols) - set(features_to_drop))
+                self.categorical_cols = list(set(self.categorical_cols) - set(features_to_drop))
+                self.bool_cols = list(set(self.bool_cols) - set(features_to_drop))
             return importance_df
         else:
             raise AssertionError("Please set a target feature first!")
@@ -696,3 +746,12 @@ def standardize_column_name(x):
     x = re.sub("ü","ue", x)
     x = re.sub("ß","ss", x)
     return re.sub('[^A-Za-z0-9_]+', '', x)
+
+def get_extreme_values(serie):
+    """ find borders for detecting extreme values
+    """
+    q75, q25 = np.nanpercentile(serie, [75,25])
+    intr_qr = q75 - q25 
+    upper = q75+(1.5*intr_qr)
+    lower = q25-(1.5*intr_qr)
+    return ("{:.2f}".format(lower), "{:.2f}".format(upper))

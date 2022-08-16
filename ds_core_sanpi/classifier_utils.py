@@ -12,7 +12,7 @@ from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
 from sklearn.ensemble import BaggingClassifier, ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier, StackingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
-from sklearn.metrics import confusion_matrix, make_scorer, accuracy_score, recall_score, precision_score, roc_auc_score, f1_score
+from sklearn.metrics import confusion_matrix, make_scorer, accuracy_score, recall_score, precision_score, roc_auc_score, f1_score, roc_auc_score
 from sklearn.model_selection import cross_validate, cross_val_predict, KFold, train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
@@ -24,20 +24,18 @@ from sklearn.tree import DecisionTreeClassifier
 class Classifier:
 
     dict_classifiers = {
-        "LR": LogisticRegression(),
-        "Ridge": RidgeClassifier(),
+        "LR": LogisticRegression(random_state=42),
+        "Ridge": RidgeClassifier(random_state=42),
         "KNC": KNeighborsClassifier(),
-        "SVC_linear": SVC(probability=True, kernel='linear'),
-        "SVC_poly": SVC(probability=True, kernel='poly'),
-        "SVC_default": SVC(probability=True, kernel="sigmoid"),
-        "GBC": GradientBoostingClassifier(),
-        "LGBMC": LGBMClassifier(),
-        "DTC": DecisionTreeClassifier(),
-        "RFC": RandomForestClassifier(),
+        "SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
+        "GBC": GradientBoostingClassifier(random_state=42),
+        "LGBMC": LGBMClassifier(random_state=42),
+        "DTC": DecisionTreeClassifier(random_state=42),
+        "RFC": RandomForestClassifier(random_state=42),
         "GNB": GaussianNB(),
-        "Bagging": BaggingClassifier(), # base_estimator=KNeighborsClassifier()
-        "Extra": ExtraTreesClassifier(max_depth=None),
-        "CatBoost": CatBoostClassifier(silent=True)
+        "Bagging": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
+        "Extra": ExtraTreesClassifier(max_depth=None, random_state=42),
+        "CatBoost": CatBoostClassifier(silent=True, random_state=42)
     }
     
     def __init__(self, data, keep_cols, target, online=False, verbose=True):
@@ -106,7 +104,7 @@ class Classifier:
         """ oversampling method for imbalanced data
         """
         if hasattr(self, 'X_train'): 
-            over = SMOTE(k_neighbors=k)
+            over = SMOTE(k_neighbors=k, random_state=42)
             self.X_train, self.y_train = over.fit_resample(self.X_train, self.y_train)
             self.X = self.X_train.copy()
             self.y = self.y_train.copy()
@@ -238,7 +236,7 @@ class Classifier:
         # check model performances with parallel computing
         cores = multiprocessing.cpu_count()
         workers = round(cores/2)
-        df_scores = pd.DataFrame(columns = ['model', 'accuracy', 'recall', 'precision', 'f1_score'])
+        df_scores = pd.DataFrame(columns = ['model', 'accuracy', 'recall', 'precision', 'f1_score', 'roc_auc'])
         with futures.ProcessPoolExecutor(max_workers=workers) as executor:
             jobs = {}
             for model, model_instantiation in self.dict_classifiers.items():
@@ -259,7 +257,8 @@ class Classifier:
                 print(f"{model} scores:")
                 [print('\t', key,':', val) for key, val in scores.items()]
                 score_entry = {'model': model, 'accuracy': scores["accuracy"], 
-                               'recall': scores["recall"], 'precision': scores["precision"], 'f1_score': scores["f1_score"]}
+                               'recall': scores["recall"], 'precision': scores["precision"], 
+                               'f1_score': scores["f1_score"], 'roc_auc': scores['roc_auc']}
                 df_scores = df_scores.append(score_entry, ignore_index = True)
         # sort score dataframe by f1-values
         df_scores.sort_values('f1_score', ascending=False, inplace=True)
@@ -281,7 +280,7 @@ class Classifier:
             else:
                 raise AssertionError("Please pass over a model to proceed!")
         elif model == "lr":
-            model = LogisticRegression()
+            model = LogisticRegression(random_state=42)
         elif model == "best":
             model = self.best_model
         elif model == "stack":
@@ -310,7 +309,7 @@ class Classifier:
                 else:
                     raise AssertionError("Please pass over a model to proceed!")
             elif model == "lr":
-                model = LogisticRegression()
+                model = LogisticRegression(random_state=42)
             elif model == "best":
                 model = self.best_model
             elif model == "stack":
@@ -339,7 +338,8 @@ class Classifier:
         scores["accuracy"] = round(accuracy_score(y_test, preds, normalize=True), 3)
         scores["recall"] = round(recall_score(y_test, preds, average=score), 3)
         scores["precision"] = round(precision_score(y_test, preds, average=score), 3)
-        scores["f1_score"] = round(f1_score(y_test, preds, average=score), 3)   
+        scores["f1_score"] = round(f1_score(y_test, preds, average=score), 3)
+        scores["roc_auc"] = round(roc_auc_score(y_test, preds, average=score, multi_class='ovr'), 3)   
         scores["test_sample"] = len(y_test)    
         return scores
         
@@ -352,7 +352,7 @@ class Classifier:
             else:
                 raise AssertionError("Please pass over a model to proceed!")
         elif model == "lr":
-            model = LogisticRegression()
+            model = LogisticRegression(random_state=42)
         elif model == "best":
             model = self.best_model
         elif model == "stack":
@@ -411,7 +411,7 @@ class Classifier:
             that are defined after experimenting all models
         """
         if hasattr(self, 'base_models'): 
-            meta_model = LogisticRegression()
+            meta_model = LogisticRegression(random_state=42)
             final_model = StackingClassifier(estimators=self.base_models, final_estimator=meta_model, cv=5)
             return final_model
         else:
@@ -437,7 +437,7 @@ class Classifier:
             else:
                 raise AssertionError("Please pass over a model to proceed!")
         elif model == "lr":
-            model = LogisticRegression()
+            model = LogisticRegression(random_state=42)
         elif model == "best":
             model = self.best_model
         elif model == "stack":
