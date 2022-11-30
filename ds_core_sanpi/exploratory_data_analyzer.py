@@ -3,16 +3,20 @@ import math
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+import pingouin as pg
 import re
 import seaborn as sns
+import statsmodels.api as sm
 import warnings
 from azureml.core import Run
-from category_encoders import TargetEncoder, LeaveOneOutEncoder, WOEEncoder
 from catboost import CatBoostRegressor
-from classifier_utils import Classifier
+from category_encoders import TargetEncoder, LeaveOneOutEncoder, WOEEncoder
+from classifier_utils import Classifier, classification_metrics
 from lightgbm import LGBMRegressor, LGBMClassifier
 from lofo import LOFOImportance, FLOFOImportance, Dataset, plot_importance
-from regressor_utils import Regressor
+from regressor_utils import Regressor, regression_metrics
+from scipy import stats
+from scipy.stats import norm
 from sklearn.decomposition import PCA
 from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, GradientBoostingRegressor
 from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier
@@ -22,6 +26,7 @@ from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
 from sklearn.metrics import confusion_matrix, make_scorer, accuracy_score, recall_score, precision_score, roc_auc_score, f1_score
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_squared_log_error, mean_absolute_percentage_error
 from sklearn.model_selection import cross_val_predict, KFold
+from statsmodels.graphics.gofplots import qqplot_2samples
 warnings.filterwarnings("ignore")
 
 
@@ -44,31 +49,36 @@ class EDA_Preprocessor:
         # id cols 
         self.keep_cols = keep_cols
         # bool columns
-        self.bool_cols = list(set(data.select_dtypes(include=['bool']).columns.tolist()) - set(drop_cols) - set(keep_cols) - set([target_col]))
+        bool_cols = []
+        for i in list(set(data.columns) - set(drop_cols) - set(keep_cols) - set([target_col])):
+            serie = data[i][data[i].notna()].astype("str")
+            if serie.isin(["False", "True"]).all():
+                bool_cols.append(i)
+        data[bool_cols] = data[bool_cols].astype(float)
+        #bool_cols = list(set(data[data.notna()].select_dtypes(include=['bool']).columns.tolist()) - set(drop_cols) - set(keep_cols) - set([target_col]))
         # convert hidden object numeric cols to float
         object_cols = data.select_dtypes(include=['object']).columns.tolist()
         num_cols = [i for i in object_cols if all(data[data[i].notnull()][i].apply(lambda x: str(x).isnumeric()))]
-        data[num_cols] = data[num_cols].fillna("0").astype(float)
+        data[num_cols] = data[num_cols].apply(lambda x: pd.to_numeric(x, errors='coerce'), axis=0) 
         # categorical ones
         self.categorical_cols = list(set(object_cols) - set(num_cols) - set(drop_cols) - set(keep_cols) - set([target_col]))
+        # convert bool to integer and define binary columns
+        self.binary_cols = data.columns[data.isin([0,1,np.nan]).all()].tolist()
+        self.binary_cols = list(set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col]))
         # numeric columns
         numeric_cols = data.select_dtypes(include=np.number).columns.tolist()
-        self.numeric_cols = list(set(numeric_cols) - set(drop_cols) - set(keep_cols) - set([target_col]))
-        # convert bool to integer
-        data[self.bool_cols] = data[self.bool_cols].astype(int)
+        self.numeric_cols = list(set(numeric_cols) - set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col]))
         # report columns
         print("EDA_Preprocessor instance initialized with data:\n",
              f"\tKeeping columns: {len(self.keep_cols)}\n",
              f"\tNumeric features: {len(self.numeric_cols)}\n",
              f"\tCategorical features: {len(self.categorical_cols)}\n",
-             f"\tBoolean features: {len(self.bool_cols)}")
-        # set transformation columns: not boolean ones, target neither the binary ones
-        self.transform_cols = list(set(self.numeric_cols) - set(self.bool_cols + data.columns[data.isin([0,1,np.nan]).all()].tolist()))
+             f"\tBinary features: {len(self.binary_cols)}")
         # set the final columns and data
         if self.target != "": 
-            all_cols = keep_cols + sorted(self.numeric_cols) + sorted(self.bool_cols) + sorted(self.categorical_cols) + [self.target]
+            all_cols = keep_cols + sorted(self.numeric_cols) + sorted(self.binary_cols) + sorted(self.categorical_cols) + [self.target]
         else:
-            all_cols = keep_cols + sorted(self.numeric_cols) + sorted(self.bool_cols) + sorted(self.categorical_cols)
+            all_cols = keep_cols + sorted(self.numeric_cols) + sorted(self.binary_cols) + sorted(self.categorical_cols)
         self.df = data[all_cols]
         self.df.reset_index(inplace=True, drop=True)
         print("EDA data is now as follows:")
@@ -87,6 +97,21 @@ class EDA_Preprocessor:
             self.df[i] = 0
         self.df = self.df[cols]
         print("Shape after alignment:", self.df.shape)
+
+    def drop_cols(self, cols):
+        """ drop given columns from the data
+        """
+        # drop given columns
+        self.df.drop(cols, axis=1, inplace=True)
+        self.numeric_cols = list(set(self.numeric_cols) - set(cols))
+        self.categorical_cols = list(set(self.categorical_cols) - set(cols))
+        self.binary_cols = list(set(self.binary_cols) - set(cols))
+        # report columns now
+        print(f"Data shape: {self.df.shape}\n",
+              f"\tKeeping columns: {len(self.keep_cols)}\n",
+              f"\tNumeric features: {len(self.numeric_cols)}\n",
+              f"\tCategorical features: {len(self.categorical_cols)}\n",
+              f"\tBinary features: {len(self.binary_cols)}")
 
     def pca_decomposition(self, number_of_pc=-1, name=""):
         """ PCA decomposition of the data using only the numeric features
@@ -118,63 +143,256 @@ class EDA_Preprocessor:
             raise AssertionError("Please set a target feature first!")
     
     ### DISTRIBUTION PLOTS ###
-    def check_outliers(self, cols=None):
+    def get_outliers(self, cols=None):
         """ check numeric outliers by percentile analysis
-        """   
+        """  
+        outlier_df = pd.DataFrame(columns=['Feature', 'Total Outliers', 'Lower limit', 'Upper limit', 
+                                           'Min', '1th', '5th', 'Median', '95th', '99th', 'Max']) 
         if cols is None:  
             cols = self.numeric_cols
         for col in cols:
-            print(col.upper())
-            print("\tStatistical outliers:\t", get_extreme_values(self.df[col]))
-            vfunc = np.vectorize(lambda x: "{:.2f}".format(x))
-            print("\t0-1-5-50-95-99-100 Percentiles:\t", vfunc(np.nanpercentile(self.df[col], [0,1,5,50,95,99,100])))
+            lower, upper, total = calc_interquartile(self.df, col)
+            if total != 0:
+                outlier_df = outlier_df.append({
+                    'Feature': col, 
+                    'Total Outliers': total,
+                    'Lower limit': lower,
+                    'Upper limit': upper, 
+                    'Min': "{:.2f}".format(np.nanpercentile(self.df[col], 0)),
+                    '1th': "{:.2f}".format(np.nanpercentile(self.df[col], 1)),
+                    '5th': "{:.2f}".format(np.nanpercentile(self.df[col], 5)),
+                    'Median': "{:.2f}".format(np.nanpercentile(self.df[col], 50)),
+                    '95th': "{:.2f}".format(np.nanpercentile(self.df[col], 95)),
+                    '99th': "{:.2f}".format(np.nanpercentile(self.df[col], 99)),
+                    'Max': "{:.2f}".format(np.nanpercentile(self.df[col], 100))
+                    }, ignore_index=True)
+        return outlier_df
 
-    def numeric_distributions(self, cols=None, name=""):
-        """ show boxplot, density plot and histogram distribution
-            of selected columns in dataframe 
-        """
-        if cols is None:  
-            cols = self.numeric_cols
-        for col in cols:
-            sns.set(rc={'figure.figsize':(6, 8)})
-            fig, axs = plt.subplots(nrows=3)
-            fig.suptitle(f"Distribution plots of: {col}", fontsize=20, y=0.95)
-            sns.boxplot(data=self.df, x=col, ax=axs[0])
-            sns.kdeplot(data=self.df, x=col, ax=axs[1])
-            sns.histplot(data=self.df, x=col, ax=axs[2], stat="count", discrete=True)
-            plt.show()
+    def target_distribution(self, name=""):
+        """ show target value distribution vs gaussian
+        """     
+        if (self.problem == "regression"):  
+            _, axes = plt.subplots(1, 2, figsize=(20, 7))
+            sns.distplot(self.df[self.target], fit=norm, ax=axes[0])
+            axes[0].set(title='Distribution of target vs Gaussian')
+            pg.qqplot(self.df[self.target], dist='norm', ax=axes[1]) 
+            axes[1].set(title='QQ-Plot of Target')
             if self.online_run:
                 # save figure
-                filepath=f'./outputs/distribution_of_{col}_{name}.png'
+                filepath=f'./outputs/target_distribution_{name}.png'
                 plt.savefig(filepath, dpi=600)
-                plt.close(fig)
-        # check outliers
-        self.check_outliers(cols)
+                plt.close() 
+        else:
+            raise AssertionError("Target needs to be a continuous numeric feature!")
 
-    def count_distributions(self, cols=None, name=""):
+    def value_count_distributions(self, cols=None, name=""):
         """ show count plots of given columns in dataframe 
         """
         if cols is None:  
             cols = self.categorical_cols
-        for col in cols:
-            sns.set(rc={'figure.figsize':(6, 5)})
-            sns.countplot(y=col, 
+        nrows = int(len(cols) / 3) + 1
+        _, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
+        for ax, col in zip(axes.ravel()[:len(cols)], cols):
+            labels = self.df[col].value_counts().index
+            sns.countplot(x=col, 
                           data=self.df, 
                           palette="Set3", 
-                          order=self.df[col].value_counts().index).set_title(f"Count plot of: {col}", fontsize=20)
+                          order=labels, 
+                          ax=ax)
+            if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())):
+                ax.set_xticklabels(labels, rotation=45)
+            ax.set_xlabel(col)
+            ax.set_ylabel('counts')
+
+            # show mean target 
+            if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
+                temp = self.df[self.target].groupby(self.df[col]).agg(['mean', 'size']).reset_index().sort_values(by=['size'], ascending=False)
+                temp[col] = temp[col].astype("object")
+                temp = temp.set_index(col).loc[labels].reset_index()
+                ax2 = ax.twinx()
+                ax2.scatter(temp.index, temp['mean'], color='m', label='avg. target')
+                ax2.set_ylim() # 0, 0.5
+                ax2.tick_params(axis='y', colors='m')
+                if ax == axes[0, 0]: 
+                    ax2.legend(loc='upper right')
+        for ax in axes.ravel()[len(cols):]:
+            ax.set_visible(False)
+        plt.tight_layout(w_pad=1)
+        plt.suptitle(f'Value Counts Distributions', fontsize=20, y=1.02)
+        plt.show()
+        if self.online_run:
+            # save figure
+            filepath=f'./outputs/value_count_distributions_{name}.png'
+            plt.savefig(filepath, dpi=600)
+            plt.close() 
+
+    def numeric_distributions(self, cols=None, method='kde', hue=None, name=""):
+        """ show distribution of given columns in given methodology 
+            wrt. given hue value, or without a hue value
+        """
+        if hue == "target":
+            if self.problem != "classification":
+                raise AssertionError("Hue value can't be the target for regression problems!")
+            hue = self.target
+        if cols is None:  
+            cols = self.numeric_cols
+        nrows = int(len(cols) / 3) + 1
+        fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
+        for ax, feature in zip(axes.ravel()[:len(cols)], cols):
+            if method == 'kde':
+                sns.kdeplot(data=self.df, x=feature, hue=hue, ax=ax)
+            elif method == 'cdf':
+                sns.ecdfplot(data=self.df, x=feature, hue=hue, ax=ax)
+            elif method == 'hist':
+                sns.histplot(data=self.df, x=feature, hue=hue, ax=ax, stat="count", discrete=True)
+            elif method == 'box':
+                if hue == None:
+                    sns.boxplot(data=self.df, x=feature, ax=ax)
+                else:
+                    temp = self.df[[feature, hue]]
+                    temp[hue] = temp[hue].astype(str)
+                    sns.boxplot(data=temp, x=hue, y=feature, ax=ax)
+                    del temp
+                    gc.collect()
+            elif method == 'bar':
+                if hue == None:
+                    sns.barplot(data=self.df, x=feature, ax=ax)
+                else:
+                    temp = self.df.copy()
+                    temp['counts'] = 1
+                    temp = temp.groupby([hue, feature], as_index=False).agg({'counts':'sum'})
+                    sns.barplot(data=temp, x=feature, y='counts', hue=hue, ax=ax)
+                    del temp
+                    gc.collect()
+        for ax in axes.ravel()[len(cols):]:
+            ax.set_visible(False)
+        fig.tight_layout()
+        plt.show()
+        if self.online_run:
+            filepath=f'./outputs/numeric_distributions_{name}.png'
+            plt.savefig(filepath, dpi=600)
+            plt.close() 
+
+    def rolling_window_correlation_plot(self, cols=None, name=""):
+        """ rolling window correlation of given columns with respect to target
+        """
+        if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
+            if cols is None:  
+                cols = self.numeric_cols
+            nrows = int(len(cols) / 3) + 1
+            fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
+            rolling_num = round(len(self.df) / 25)
+            for ax, feature in zip(axes.ravel()[:len(cols)], cols):
+                temp = self.df.sort_values(feature)
+                temp.reset_index(inplace=True)
+                ax.scatter(temp.index, temp[self.target].rolling(rolling_num).mean(), s=1, alpha=0.5)
+                ax.set_xlabel(feature)
+                del temp
+                gc.collect()
+            for ax in axes.ravel()[len(cols):]:
+                ax.set_visible(False)
+            fig.tight_layout()
             plt.show()
             if self.online_run:
-                # save figure
-                filepath=f'./outputs/count_of_{col}_{name}.png'
+                filepath=f'./outputs/rolling_window_correlation_{name}.png'
                 plt.savefig(filepath, dpi=600)
                 plt.close() 
+        else:
+            raise AssertionError("The target variable should be numeric to use this function!")
 
-    ### IMPUTATION FUNTIONS & FILL MISSING VALUES ###
-    def check_null_features(self, threshold=0):
-        """ check nan values 
+    def compare_distributions_in_two_data(self, df, cols=None, method="hist", name=""):
+        """ histogram or qq plot distributions of the given columns in two datasets:
+            check whether distribution of the same columns are similar or not 
+            in two datasets
         """
+        if cols is None:  
+            cols = self.numeric_cols
+        nrows = int(len(cols) / 3) + 1
+        _, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
+        for ax, col in zip(axes.ravel()[:len(cols)], cols):
+            if method == "hist":
+                mi = min(self.df[col].min(), df[col].min())
+                ma = max(self.df[col].max(), df[col].max())
+                bins = np.linspace(mi, ma, 50)
+                ax.hist(self.df[col], bins=bins, alpha=0.5, density=True, label='1st df')
+                ax.hist(df[col], bins=bins, alpha=0.5, density=True, label='2nd df')
+                ax.set_xlabel(col)
+                if ax == axes[0, 0]: 
+                    ax.legend(loc='lower left')
+            elif method == "qqplot":
+                pp_x = sm.ProbPlot(self.df[col])
+                pp_y = sm.ProbPlot(df[col])
+                qqplot_2samples(pp_x, pp_y, f"{col} quantiles in 1st data", f"{col} quantiles in 2nd data", line="45", ax=ax)
+            elif method == "bar":
+                temp = pd.concat([self.df[cols], df[cols]], axis=0).reset_index(drop=True)
+                temp["label"] = pd.Series(["1st data"] * len(self.df) + ["2nd data"] * len(df))
+                temp['counts'] = 1
+                temp = temp.groupby(["label", col], as_index=False).agg({'counts':'sum'})
+                sns.barplot(data=temp, x=col, y='counts', hue="label", ax=ax)
+                del temp
+                gc.collect()
+        for ax in axes.ravel()[len(cols):]:
+            ax.set_visible(False)
+        plt.tight_layout(w_pad=1)
+        plt.suptitle('1st and 2nd data distributions of the given features', fontsize=20, y=1.02)
+        plt.show()
+        if self.online_run:
+            filepath=f'./outputs/qqplot_{name}.png'
+            plt.savefig(filepath, dpi=600)
+            plt.close() 
+    
+    ### IMPUTATION FUNTIONS & FILL MISSING VALUES ###
+    def count_nulls(self, threshold = 50):
+        """ check number of nan values for every column
+        """
+        print("Null value counts per feature:")
         nans = self.df.isna().sum()
         print(nans[nans > threshold].sort_values(ascending=False))
+
+    def check_null_vs_target(self, threshold = 50, name=""):
+        """ test how target is changing for the samples where the features are null
+        """
+        if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
+            # start by plotting the bell curve
+            plt.figure(figsize=(12, 4))
+            z_ticks = np.linspace(-3.5, 3.5, 61)
+            pdf = stats.norm.pdf(z_ticks)
+            plt.plot(z_ticks, pdf)
+
+            # what is average of target
+            avg_target_population = self.df[self.target].mean()
+
+            # calculate the conditional average target for every missing feature
+            print('feature                               avg_target              z    p-value')
+            for f in self.df.columns:
+                if self.df[f].isna().sum() > threshold:
+                    sample_size = self.df[f].isna().sum()
+                    avg_target_sample = self.df[self.df[f].isna()][self.target].mean()
+                    z = (avg_target_sample - avg_target_population) / (self.df[self.target].std() / np.sqrt(sample_size))
+                    plt.scatter([z], [stats.norm.pdf(z)], c='r' if abs(z) > 2 else 'g', s=100)
+                    print(f"{f:30} :           {avg_target_sample:.3f}          {z:5.2f}      {2*stats.norm.cdf(-abs(z)):.3f}")
+                    if abs(z) > 1: plt.annotate(f"{f}: {avg_target_sample:.3f}",
+                                                (z, stats.norm.pdf(z)),
+                                                xytext=(0,10), 
+                                                textcoords='offset points', ha='left' if z > 0 else 'right',
+                                                color='r' if abs(z) > 2 else 'g')
+            # annotate the center (z=0)
+            plt.vlines([0], 0, 0.05, color='g')
+            plt.annotate(f"z_score = 0\naverage target: {avg_target_population:.3f}",
+                                                (0, 0.05),
+                                                xytext=(0,10), 
+                                                textcoords='offset points', ha='center',
+                                                color='g')
+            plt.title('Average target when feature is missing')
+            plt.yticks([])
+            plt.xlabel('z_score')
+            plt.show()
+            if self.online_run:
+                filepath=f'./outputs/null_vs_target_{name}.png'
+                plt.savefig(filepath, dpi=600)
+                plt.close() 
+        else:
+            raise AssertionError("The target variable should be numeric to use this function!")
 
     def replace_inf_values(self):
         """ get rid of inf values 
@@ -209,6 +427,10 @@ class EDA_Preprocessor:
             ).fillna(0)
         elif strategy == "zero":
             self.df[self.numeric_cols] = self.df[self.numeric_cols].fillna(0)
+        # filling binary cols with median    
+        self.df[self.binary_cols] = self.df[self.binary_cols].fillna(
+            self.df[self.binary_cols].median()
+        ).fillna(0)
         # filling categorical cols with unknown class
         self.df[self.categorical_cols] = self.df[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
         print("After filling missing values in EDA data:")
@@ -240,17 +462,22 @@ class EDA_Preprocessor:
             + initial_strategy: {"mean", "median", "most_frequent", "constant"}
             + imputation_order: {"ascending", "descending", "roman", "arabic", "random"}
         """
-        categorical_cols = self.df.columns[self.df.dtypes==object].tolist()
+        nans = self.df.isna().sum()
+        cols = nans[nans > 0].index.tolist()
+        cols = list(set(cols) - set(self.keep_cols) - set([self.target]))
+        for i in cols:
+            self.df[i + "_missing"] = np.where(self.df[i].isna(), 1, 0)
+        categorical_cols = self.df[cols].columns[self.df[cols].dtypes==object].tolist()
         if len(categorical_cols) == 0:
-            cols = list(set(self.df.columns) - set(self.keep_cols) - set([self.target]))
             imp_num = IterativeImputer(estimator=estimator, 
                                        missing_values=missing_values, 
                                        initial_strategy=initial_strategy,
                                        imputation_order=imputation_order,
                                        random_state=0)
             self.df[cols] = imp_num.fit_transform(self.df[cols])
-            self.imputed_cols = cols
-            self.check_null_features()
+            print("Imputation is done on the following columns: total = ", len(cols), 
+                  "\n", cols) 
+            self.count_nulls()
             return imp_num
         else:
             raise AssertionError("The data has categorical features, please first handle them!")
@@ -263,7 +490,8 @@ class EDA_Preprocessor:
             print(f"Column {col} is already full!")
             return
         df_copy = self.df.copy()
-        df_copy.drop(columns=self.target, axis=1, inplace=True)
+        if self.target != "":
+            df_copy.drop(columns=self.target, axis=1, inplace=True)
         categoric_cols = list(set(self.categorical_cols) - set([col]))
         if len(categoric_cols) > 0:
             # filling categorical cols with unknown class
@@ -282,11 +510,7 @@ class EDA_Preprocessor:
         classifier = LGBMClassifier(random_state=42)
         # measure how good it is
         preds = cross_val_predict(classifier, df_copy.iloc[train_indexes][features], encoded_y, cv=5)  
-        scores = {}
-        scores["accuracy"] = round(accuracy_score(encoded_y, preds, normalize=True), 3)  
-        scores["recall"] = round(recall_score(encoded_y, preds, average='weighted'), 3) 
-        scores["precision"] = round(precision_score(encoded_y, preds, average='weighted'), 3)    
-        scores["f1_score"] = round(f1_score(encoded_y, preds, average='weighted'), 3)       
+        scores = classification_metrics(encoded_y, preds, score="weighted", model_name="LGBMC")     
         [print('\t', key,':', val) for key, val in scores.items()]
         # fit model
         classifier.fit(df_copy.iloc[train_indexes][features], encoded_y)
@@ -304,7 +528,8 @@ class EDA_Preprocessor:
             print(f"Column {col} is already full!")
             return
         df_copy = self.df.copy()
-        df_copy.drop(columns=self.target, axis=1, inplace=True)
+        if self.target != "":
+            df_copy.drop(columns=self.target, axis=1, inplace=True)
         if len(self.categorical_cols) > 0:
             # filling categorical cols with unknown class
             df_copy[self.categorical_cols] = df_copy[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
@@ -320,11 +545,7 @@ class EDA_Preprocessor:
         regressor = LGBMRegressor(random_state=42)
         # measure how good it is
         preds = cross_val_predict(regressor, df_copy.iloc[train_indexes][features], df_copy.iloc[train_indexes][col], cv=5) 
-        scores = {}
-        scores["MAE"] = round(mean_absolute_error(df_copy.iloc[train_indexes][col], preds), 3)  
-        scores["RMSE"] = round(mean_squared_error(df_copy.iloc[train_indexes][col], preds, squared=False), 3) 
-        scores["R2"] = round(r2_score(df_copy.iloc[train_indexes][col], preds), 3)    
-        scores["MAPE"] = round(mean_absolute_percentage_error(df_copy.iloc[train_indexes][col], preds), 3) 
+        scores = regression_metrics(df_copy.iloc[train_indexes][col], preds, model_name="LGBMR")
         [print('\t', key,':', val) for key, val in scores.items()]
         # fit model
         regressor.fit(df_copy.iloc[train_indexes][features], df_copy.iloc[train_indexes][col])
@@ -382,6 +603,8 @@ class EDA_Preprocessor:
             elif method == "woe":
                 encoder = WOEEncoder(handle_missing="return_nan", handle_unknown="return_nan")
             self.df[self.categorical_cols] = encoder.fit_transform(self.df[self.categorical_cols], self.df[self.target])
+            print("Target encoding is done on the following columns: total = ", len(self.categorical_cols), 
+                  "\n", self.categorical_cols) 
             return encoder
         else:
             raise AssertionError("The classification problem is not applicable for target encoding!")
@@ -401,44 +624,54 @@ class EDA_Preprocessor:
         print("Shape after dummification:", self.df.shape)
 
     ### TRANSFORMATION FUNCTIONS ###
+    def target_log_transform(self):
+        """ do log transformation on the target variable
+        """   
+        if (self.problem == "regression"): 
+            new_target = self.target + "_log" 
+            self.df[new_target] = np.log(self.df[self.target])
+            self.target = new_target
+        else:
+            raise AssertionError("Target needs to be a continuous numeric feature!")
+
     def power_transformation(self):
         """ do power transformation on the numeric columns to handle skewness 
             of the data and make it more closer to normal distribution
         """                          
         power = PowerTransformer(method='yeo-johnson', standardize=True)
-        self.df[self.transform_cols] = pd.DataFrame(data = power.fit_transform(self.df[self.transform_cols]), columns=self.transform_cols)   
-        print("Power transformation is done on the following numeric columns: total = ", len(self.transform_cols), 
-              "\n", self.transform_cols)     
+        self.df[self.numeric_cols] = pd.DataFrame(data = power.fit_transform(self.df[self.numeric_cols]), columns=self.numeric_cols)   
+        print("Power transformation is done on the following numeric columns: total = ", len(self.numeric_cols), 
+              "\n", self.numeric_cols)     
         return power 
 
     def standardizer(self):
         """ do standardization on the numeric columns
         """              
         scaler = StandardScaler()
-        self.df[self.transform_cols] = pd.DataFrame(data = scaler.fit_transform(self.df[self.transform_cols]), columns=self.transform_cols)     
-        print("Standardization is done on the following numeric columns: total = ", len(self.transform_cols), 
-              "\n", self.transform_cols)     
+        self.df[self.numeric_cols] = pd.DataFrame(data = scaler.fit_transform(self.df[self.numeric_cols]), columns=self.numeric_cols)     
+        print("Standardization is done on the following numeric columns: total = ", len(self.numeric_cols), 
+              "\n", self.numeric_cols)     
         return scaler
 
     def apply_transformer(self, transformer):
         """ apply transformation given a transformer object 
         """  
-        self.df[self.transform_cols] = pd.DataFrame(data = transformer.transform(self.df[self.transform_cols]), columns=self.transform_cols)   
-        print("Transformation object is used to transform the following numeric columns: total = ", len(self.transform_cols), 
-              "\n", self.transform_cols)    
+        self.df[self.numeric_cols] = pd.DataFrame(data = transformer.transform(self.df[self.numeric_cols]), columns=self.numeric_cols)   
+        print("Transformation object is used to transform the following numeric columns: total = ", len(self.numeric_cols), 
+              "\n", self.numeric_cols)    
               
     def show_skewness(self):
         """ calculate and print skewness of all transformation columns 
         """
         print("Skewness:")
-        print(self.df[self.transform_cols].skew().sort_values(ascending=False))
+        print(self.df[self.numeric_cols].skew().sort_values(ascending=False))
     
     ### CORRELATION FUNCTIONS ###
     def resolve_correlation(self, drop=True):
         """ remove highly correlated features 
         """
         # create correlation matrix
-        corr_matrix = self.df[self.numeric_cols + self.bool_cols].corr().abs().round(2)
+        corr_matrix = self.df[self.numeric_cols + self.binary_cols].corr().abs().round(2)
         # select upper triangle of correlation matrix
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(np.bool))
         # find features with correlation greater than 0.95
@@ -447,19 +680,20 @@ class EDA_Preprocessor:
         # drop features 
         if drop:
             self.numeric_cols = list(set(self.numeric_cols) - set(to_drop))
-            self.transform_cols = list(set(self.transform_cols) - set(to_drop))
+            self.binary_cols = list(set(self.binary_cols) - set(to_drop))
             self.df.drop(to_drop, axis=1, inplace=True)
             print("Shape becomes:", self.df.shape)
-        if self.online_run:
-            self.run.log_list(name='Highly correlated columns are:', value=to_drop)
+        if self.online_run & (len(to_drop) > 0):
+            self.run.log_list('Highly correlated columns are:', to_drop)
 
     def heatmap_correlation(self, name=""):
         """ show correlation heatmap of numeric features 
         """ 
         if self.target != "": 
-            features = self.transform_cols + [self.target] 
+            features = self.numeric_cols + self.binary_cols + [self.target] 
         else:
-            features = self.transform_cols
+            features = self.numeric_cols + self.binary_cols
+        features = self.df[features].loc[:, self.df[features].nunique() > 1].columns.tolist()
         unit_size = np.sqrt(len(features)*3)
         df_analysis = self.df[features].corr().round(2)
         sns.set(rc={'figure.figsize':(unit_size*3, unit_size*2.5)})
@@ -470,80 +704,9 @@ class EDA_Preprocessor:
             filename=f'./outputs/heatmap_correlation_{name}.png'
             plt.savefig(filename, dpi=600)
             plt.close()
-    
-    def categorical_correlation(self, cols=None, name="", rotate=False):
-        """ show correlation of given categorical features
-            wrt. to target feature
-        """
-        if cols is None:  
-            cols = self.categorical_cols
-        if self.target != "": 
-            if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
-                for col in cols:
-                    sns.set(rc={'figure.figsize':(6, 5)})
-                    ax = sns.catplot(x=col, y=self.target, kind="bar", data=self.df)
-                    ax.fig.suptitle(f"Correlation plot of: {col} to {self.target}", fontsize=20, y=1.05)
-                    if rotate:
-                        ax.set_xticklabels(rotation=30)
-                    print(self.df.groupby(col)[self.target].mean())
-                    plt.show()
-                    if self.online_run:
-                        # save figure
-                        filename=f'./outputs/categorical_correlation_{col}_{name}.png'
-                        plt.savefig(filename, dpi=600)
-                        plt.close()
-            else:
-                for col in cols:
-                    for unique_val in self.df[col].unique().tolist():
-                        value_counts = self.df[self.df[col] == unique_val][self.target].value_counts(normalize=True)
-                        sns.set(rc={'figure.figsize':(6, 5)})
-                        ax = sns.catplot(x=value_counts.index, y=value_counts.values, kind="bar", data=self.df)
-                        ax.fig.suptitle(f"Correlation plot of: {col} of {unique_val}", fontsize=20, y=1.05)
-                        if rotate:
-                            ax.set_xticklabels(rotation=30)
-                        plt.show()
-                        if self.online_run:
-                            # save figure
-                            filename=f'./outputs/categorical_correlation_of_{col}_in_{unique_val}.png'
-                            plt.savefig(filename, dpi=600)
-                            plt.close()
-        else:
-            raise AssertionError("Please set a target feature first!")
 
     ### PERFORMANCE METRICS & PLOTS ###
-    def regression_metrics(self, col1, col2):
-        """ show metrics for selected two continuous columns to be
-            compared with each other 
-        """      
-        MAE = mean_absolute_error(self.df[col1], self.df[col2])
-        RMSE = mean_squared_error(self.df[col1], self.df[col2], squared=False)
-        R2 = r2_score(self.df[col1], self.df[col2])
-        LOG = np.sqrt(mean_squared_log_error(self.df[col1], self.df[col2]))
-        MAPE = mean_absolute_percentage_error(self.df[col1], self.df[col2])
-        print("Mean Absolute Error:", MAE)
-        print("Root Mean Square Error:", RMSE)
-        print("R2 Score:", R2)
-        print("Mean Squared Log Error:", LOG)
-        print("Mean Absolute Percentage Error:", MAPE)
-
-    def reg_plot(self, col, name=""):
-        """ relationship btw. target and given column
-        """
-        if self.target != "": 
-            plt.figure(figsize=(15, 12))
-            ax = sns.regplot(x=self.df[col], y=self.df[self.target], order=2)
-            ax.set_xlabel(f'given column: {col}')
-            ax.set_ylabel(f'target value: {self.target}')
-            plt.show()
-            if self.online_run:
-                # save figure
-                filepath=f'./outputs/reg_plot_of_{col}_{name}.png'
-                plt.savefig(filepath, dpi=600)
-                plt.close() 
-        else:
-            raise AssertionError("Please set a target feature first!")
-
-    def how_close_two_continious_features_are(self, col1, col2, lower_threshold, higher_threshold, res=0.05):
+    def how_similar_two_features(self, col1, col2, lower_threshold=0.4, higher_threshold=2.5, res=0.05):
         """ show histogram distribution of the ratio between
             selected two continuous columns in the dataframe
             that wanted to be same in ideal case 
@@ -555,7 +718,8 @@ class EDA_Preprocessor:
         df_ratio["abs_percentage_error"] = round(100*(np.absolute(df_ratio["percentage_error"])), 1) 
         # regression metrics
         print("Regression metrics:")
-        self.regression_metrics(col1, col2)    
+        scores = regression_metrics(self.df[col1], self.df[col2], model_name="No Model")
+        [print('\t', key,':', val) for key, val in scores.items()]  
         # take the ratio
         df_ratio["ratio"] = df_ratio[col1] / df_ratio[col2]
         df_ratio_ = df_ratio[(df_ratio["ratio"] > lower_threshold) & (df_ratio["ratio"] < higher_threshold)]
@@ -627,7 +791,7 @@ class EDA_Preprocessor:
             important_features = self.X.columns[sorted_idx].tolist()
             unimportant_features = list(set(self.X.columns) - set(important_features))
             if self.online_run:
-                self.run.log_list(name='Important features', value=important_features)
+                self.run.log_list('Important features', important_features)
                 # save figure
                 filename=f'./outputs/feature_importance_{name}.png'
                 plt.savefig(filename, dpi=600)
@@ -636,9 +800,8 @@ class EDA_Preprocessor:
             self.df.drop(unimportant_features, axis=1, inplace=True)
             self.X.drop(unimportant_features, axis=1, inplace=True)
             self.numeric_cols = list(set(self.numeric_cols) - set(unimportant_features))
-            self.transform_cols = list(set(self.transform_cols) - set(unimportant_features))
             self.categorical_cols = list(set(self.categorical_cols) - set(unimportant_features))
-            self.bool_cols = list(set(self.bool_cols) - set(unimportant_features))
+            self.binary_cols = list(set(self.binary_cols) - set(unimportant_features))
             return important_features
         else:
             raise AssertionError("Please set a target feature first!")
@@ -710,9 +873,8 @@ class EDA_Preprocessor:
                 self.df.drop(features_to_drop, axis=1, inplace=True)
                 self.X.drop(features_to_drop, axis=1, inplace=True)
                 self.numeric_cols = list(set(self.numeric_cols) - set(features_to_drop))
-                self.transform_cols = list(set(self.transform_cols) - set(features_to_drop))
                 self.categorical_cols = list(set(self.categorical_cols) - set(features_to_drop))
-                self.bool_cols = list(set(self.bool_cols) - set(features_to_drop))
+                self.binary_cols = list(set(self.binary_cols) - set(features_to_drop))
             return importance_df
         else:
             raise AssertionError("Please set a target feature first!")
@@ -747,11 +909,13 @@ def standardize_column_name(x):
     x = re.sub("ß","ss", x)
     return re.sub('[^A-Za-z0-9_]+', '', x)
 
-def get_extreme_values(serie):
-    """ find borders for detecting extreme values
+def calc_interquartile(df, column):
+    """ detecting extreme values statistically
     """
-    q75, q25 = np.nanpercentile(serie, [75,25])
+    q75, q25 = np.nanpercentile(df[column], [75,25])
     intr_qr = q75 - q25 
     upper = q75+(1.5*intr_qr)
     lower = q25-(1.5*intr_qr)
-    return ("{:.2f}".format(lower), "{:.2f}".format(upper))
+    upper_outliers = df[df[column] > upper]
+    lower_outliers = df[df[column] < lower]
+    return "{:.2f}".format(lower), "{:.2f}".format(upper), lower_outliers.shape[0]+upper_outliers.shape[0]

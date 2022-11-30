@@ -1,19 +1,20 @@
 import matplotlib.pyplot as plt
-import multiprocessing
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import shap
+import string
 import time
 from azureml.core import Run
 from catboost import CatBoostClassifier
-from concurrent import futures 
 from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
+from pathos.helpers import cpu_count
+from pathos.pools import ProcessPool
 from sklearn.ensemble import BaggingClassifier, ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier, StackingClassifier, VotingClassifier
 from sklearn.linear_model import LogisticRegression, RidgeClassifier
-from sklearn.metrics import confusion_matrix, make_scorer, accuracy_score, recall_score, precision_score, roc_auc_score, f1_score, roc_auc_score
-from sklearn.model_selection import cross_validate, cross_val_predict, KFold, train_test_split
+from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, precision_score, f1_score, roc_auc_score
+from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder
@@ -29,11 +30,11 @@ class Classifier:
         "KNC": KNeighborsClassifier(),
         "SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
         "GBC": GradientBoostingClassifier(random_state=42),
-        "LGBMC": LGBMClassifier(random_state=42),
         "DTC": DecisionTreeClassifier(random_state=42),
-        "RFC": RandomForestClassifier(random_state=42),
         "GNB": GaussianNB(),
         "Bagging": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
+        "LGBMC": LGBMClassifier(random_state=42),
+        "RFC": RandomForestClassifier(random_state=42),
         "Extra": ExtraTreesClassifier(max_depth=None, random_state=42),
         "CatBoost": CatBoostClassifier(silent=True, random_state=42)
     }
@@ -41,7 +42,7 @@ class Classifier:
     def __init__(self, data, keep_cols, target, online=False, verbose=True):
         """ construction of Classifier class 
         """
-        self.data = data
+        self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + [target]))) + [target]]
         self.target = target
         self.keep_cols = keep_cols
         self.split_x_and_y(verbose) 
@@ -64,7 +65,7 @@ class Classifier:
     def split_x_and_y(self, verbose=True):
         """ split target from the data 
         """
-        self.features = list(set(self.data.columns.tolist()) - set(self.keep_cols) - set([self.target]))
+        self.features = sorted(list(set(self.data.columns.tolist()) - set(self.keep_cols + [self.target])))
         if verbose:
             print("Training will be done using the following features:\n", self.features)
         self.X = self.data[self.features].copy()
@@ -230,36 +231,32 @@ class Classifier:
 
     ### SCORE MODELS ###
     def experiment_models(self, cv=5, score="weighted", in_test=False):
-        """ experiment the bunch of classification models for the 
-            classification problem: return the dataframe of scores
+        """ check model performances with parallel computing
         """
-        # check model performances with parallel computing
-        cores = multiprocessing.cpu_count()
-        workers = round(cores/2)
-        df_scores = pd.DataFrame(columns = ['model', 'accuracy', 'recall', 'precision', 'f1_score', 'roc_auc'])
-        with futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            jobs = {}
-            for model, model_instantiation in self.dict_classifiers.items():
-                try:
-                    print(f'{model} is training:')
-                    if in_test == True:
-                        job = executor.submit(self.score_in_test, model = model_instantiation, score=score)
-                    else:
-                        job = executor.submit(self.cv_score_model, model = model_instantiation, cv=cv, score=score)
-                except Exception as e:
-                     print(model, "raises an exception while scoring:", e)
-                     continue
-                jobs[job] = model
-                time.sleep(1)  # this is just to make the output look nicer
-            for job in futures.as_completed(jobs):
-                model = jobs[job]
-                scores = job.result()
-                print(f"{model} scores:")
-                [print('\t', key,':', val) for key, val in scores.items()]
-                score_entry = {'model': model, 'accuracy': scores["accuracy"], 
-                               'recall': scores["recall"], 'precision': scores["precision"], 
-                               'f1_score': scores["f1_score"], 'roc_auc': scores['roc_auc']}
-                df_scores = df_scores.append(score_entry, ignore_index = True)
+        cores = cpu_count()
+        pool = ProcessPool(cores)
+        model_names = list(self.dict_classifiers.keys())
+        models = list(self.dict_classifiers.values())
+        # experiment bunch of regression models
+        print(f"Running models parallel with {cores} cores:", model_names)
+        n_models = len(models)
+        try:
+            if in_test == True:
+                scores_data = pool.amap(self.cv_score_model, models, model_names, [score] * n_models)
+            else:
+                scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models, [score] * n_models)
+            while not scores_data.ready():
+                time.sleep(5); print(".", end=' ')
+            scores_data = scores_data.get()
+        except Exception as e:
+            print(f"\nCouldn't run parallel because of the following exception:", e)
+            scores_data = []
+            for m_name, model in self.dict_regressors.items():
+                if in_test == True:
+                    scores_data.append(self.cv_score_model(model, m_name, score))
+                else:
+                    scores_data.append(self.cv_score_model(model, m_name, cv, score))      
+        df_scores = pd.DataFrame(scores_data)                 
         # sort score dataframe by f1-values
         df_scores.sort_values('f1_score', ascending=False, inplace=True)
         # best models => base models for stacking
@@ -270,7 +267,7 @@ class Classifier:
         self.best_model = self.base_models[0]
         return df_scores
 
-    def cv_score_model(self, model=None, cv=5, score="weighted", confusion=False):
+    def cv_score_model(self, model=None, model_name="", cv=5, score="weighted", confusion=False):
         """ do a cross validation scoring with given model if no 
             model is given then a logistic regression will be tried
         """
@@ -279,6 +276,8 @@ class Classifier:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
+        if model_name == "":
+            model_name = extract_model_name(model)
         elif model == "lr":
             model = LogisticRegression(random_state=42)
         elif model == "best":
@@ -288,18 +287,18 @@ class Classifier:
         elif model == "vote":
             model = self.voting_model()
         y = self.y.copy()
-        if (not self.not_categorical_target) & (not (str(type(model)) == "<class 'catboost.core.CatBoostClassifier'>")):
+        if (not self.not_categorical_target) & (not model_name.isin(["CatBoostClassifier", "CatBoost"])):
             y = self.encoded_y.copy()
         self.pred_test = cross_val_predict(model, self.X, y, cv=cv) 
-        if (not self.not_categorical_target) & (not (str(type(model)) == "<class 'catboost.core.CatBoostClassifier'>")):
+        if (not self.not_categorical_target) & (not model_name.isin(["CatBoostClassifier", "CatBoost"])):
             self.pred_test = self.le.inverse_transform(self.pred_test)  
         self.model = model
-        scores = self.classification_metrics(self.y, self.pred_test, score=score)  
+        scores = classification_metrics(self.y, self.pred_test, score, model_name)  
         if confusion:
-            self.apply_confusion_matrix(self.y, self.pred_test)    
+            apply_confusion_matrix(self.y, self.pred_test, self.labels, self.online_run, f"cv_{model_name}")     
         return scores
 
-    def score_in_test(self, model=None, score="weighted", confusion=False):
+    def score_in_test(self, model=None, model_name="", score="weighted", confusion=False):
         """ score the given classification model on the generated test data
         """
         if hasattr(self, 'X_train'): 
@@ -308,6 +307,8 @@ class Classifier:
                     model = self.model
                 else:
                     raise AssertionError("Please pass over a model to proceed!")
+            if model_name == "":
+                model_name = extract_model_name(model)
             elif model == "lr":
                 model = LogisticRegression(random_state=42)
             elif model == "best":
@@ -317,31 +318,19 @@ class Classifier:
             elif model == "vote":
                 model = self.voting_model()
             y_train = self.y_train 
-            if (not self.not_categorical_target) & (not (str(type(model)) == "<class 'catboost.core.CatBoostClassifier'>")):
+            if (not self.not_categorical_target) & (not model_name.isin(["CatBoostClassifier", "CatBoost"])):
                 y_train = self.encoded_y_train
             model.fit(self.X_train, y_train)
             self.pred_test = model.predict(self.X_test)
-            if (not self.not_categorical_target) & (not (str(type(model)) == "<class 'catboost.core.CatBoostClassifier'>")):
+            if (not self.not_categorical_target) & (not model_name.isin(["CatBoostClassifier", "CatBoost"])):
                 self.pred_test = self.le.inverse_transform(self.pred_test)  
             self.model = model
-            scores = self.classification_metrics(self.y_test, self.pred_test, score=score) 
+            scores = classification_metrics(self.y_test, self.pred_test, score, model_name) 
             if confusion:
-                self.apply_confusion_matrix(self.y_test, self.pred_test)    
+                apply_confusion_matrix(self.y_test, self.pred_test, self.labels, self.online_run, f"test_{model_name}")    
             return scores
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
-
-    def classification_metrics(self, y_test, preds, score="weighted"):
-        """ classification perforamce metrics 
-        """
-        scores = {}
-        scores["accuracy"] = round(accuracy_score(y_test, preds, normalize=True), 3)
-        scores["recall"] = round(recall_score(y_test, preds, average=score), 3)
-        scores["precision"] = round(precision_score(y_test, preds, average=score), 3)
-        scores["f1_score"] = round(f1_score(y_test, preds, average=score), 3)
-        scores["roc_auc"] = round(roc_auc_score(y_test, preds, average=score, multi_class='ovr'), 3)   
-        scores["test_sample"] = len(y_test)    
-        return scores
         
     def probability_prediction(self, model=None, cv=5):
         """ do a cross validation predictions with probabilities
@@ -363,38 +352,6 @@ class Classifier:
         if not self.not_categorical_target:
             y = self.encoded_y.copy()
         return cross_val_predict(model, self.X, y, cv=cv, method='predict_proba')
-
-    def apply_confusion_matrix(self, y, preds, name="", rotate=False):
-        """ confusion matrix of the classification 
-        """        
-        cf_matrix = confusion_matrix(y, preds, labels=self.labels)
-        cf_matrix_percentage = cf_matrix.astype('float') / cf_matrix.sum(axis=1)[:, np.newaxis] 
-        fig_unit_size = len(self.labels)           
-        sns.set(rc={'figure.figsize':(fig_unit_size*5, fig_unit_size*2)})
-        fig, axs = plt.subplots(ncols=2)
-        fig.suptitle(f"Confusion Matrix", fontsize=20)
-        g1 = sns.heatmap(cf_matrix, annot=True, fmt='g', cmap='Blues', ax=axs[0])
-        g2 = sns.heatmap(cf_matrix_percentage, annot=True, fmt='.1%', cmap='Blues', ax=axs[1])
-        g1.set_xlabel('Predicted Values')
-        g1.set_ylabel('Actual Values ')
-        g1.xaxis.set_ticklabels(self.labels)
-        g1.yaxis.set_ticklabels(self.labels)
-        if rotate:
-            g1.set_xticklabels(g1.get_xticklabels(), rotation=30)
-            g1.set_yticklabels(g1.get_xticklabels(), rotation=0)
-        g2.set_xlabel('Predicted Values')
-        g2.set_ylabel('Actual Values ')
-        g2.xaxis.set_ticklabels(self.labels)
-        g2.yaxis.set_ticklabels(self.labels)
-        if rotate:
-            g2.set_xticklabels(g2.get_xticklabels(), rotation=30)
-            g2.set_yticklabels(g2.get_xticklabels(), rotation=0)
-        plt.show()
-        # save figure if on cloud
-        if self.online_run:
-            filename=f'./outputs/confusion_matrix_{name}.png'
-            plt.savefig(filename, dpi=600)
-            plt.close()
 
     ### ENSEMBL MODELS ### 
     def define_base_models(self, base_list):
@@ -451,15 +408,15 @@ class Classifier:
         print("Model is fit on whole data!")
         self.trained_model = model
 
-    def predict_test(self, test):
+    def predict_test(self):
         """ train the given classification model on whole data
         """   
         if hasattr(self, 'trained_model'): 
             if (not self.not_categorical_target) & (not (str(type(self.trained_model)) == "<class 'catboost.core.CatBoostClassifier'>")):
-                preds = self.trained_model.predict(test[self.features])
+                preds = self.trained_model.predict(self.X)
                 preds = self.le.inverse_transform(preds)
             else:
-                preds = self.trained_model.predict(test[self.features]).astype(int)
+                preds = self.trained_model.predict(self.X).astype(int)
             return preds
         else:
             raise AssertionError("Please first train a model then predict on the test data!")
@@ -483,3 +440,53 @@ class Classifier:
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(self.X)
         shap.summary_plot(shap_values, self.X, feature_names = important_features)
+
+
+### AUXILIARY FUNCTIONS ###
+def classification_metrics(y_test, preds, score="weighted", model_name=""):
+    """ classification perforamce metrics 
+    """
+    return {
+        'model' : model_name,
+        'accuracy' : round(accuracy_score(y_test, preds, normalize=True), 3),
+        'recall' : round(recall_score(y_test, preds, average=score), 3),
+        'precision' : round(precision_score(y_test, preds, average=score), 3),
+        'f1_score' : round(f1_score(y_test, preds, average=score), 3),
+        'sample_size' : len(y_test)  
+    }
+
+def apply_confusion_matrix(y, preds, labels, online_run=False, name=""):
+    """ confusion matrix of the classification 
+    """        
+    cf_matrix = confusion_matrix(y, preds, labels=labels)
+    cf_matrix_percentage = cf_matrix.astype('float') / cf_matrix.sum(axis=1)[:, np.newaxis] 
+    fig_unit_size = len(labels)           
+    sns.set(rc={'figure.figsize':(fig_unit_size*5, fig_unit_size*2)})
+    fig, axs = plt.subplots(ncols=2)
+    fig.suptitle(f"Confusion Matrix", fontsize=20)
+    g1 = sns.heatmap(cf_matrix, annot=True, fmt='g', cmap='Blues', ax=axs[0])
+    g2 = sns.heatmap(cf_matrix_percentage, annot=True, fmt='.1%', cmap='Blues', ax=axs[1])
+    g1.set_xlabel('Predicted Values')
+    g1.set_ylabel('Actual Values ')
+    g1.xaxis.set_ticklabels(labels)
+    g1.yaxis.set_ticklabels(labels)    
+    if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())):
+        g1.set_xticklabels(g1.get_xticklabels(), rotation=30)
+        g1.set_yticklabels(g1.get_xticklabels(), rotation=0)
+    g2.set_xlabel('Predicted Values')
+    g2.set_ylabel('Actual Values ')
+    g2.xaxis.set_ticklabels(labels)
+    g2.yaxis.set_ticklabels(labels)
+    if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())):
+        g2.set_xticklabels(g2.get_xticklabels(), rotation=30)
+        g2.set_yticklabels(g2.get_xticklabels(), rotation=0)
+    plt.show()
+    # save figure if on cloud
+    if online_run:
+        filename=f'./outputs/confusion_matrix_{name}.png'
+        plt.savefig(filename, dpi=600)
+        plt.close()
+
+def extract_model_name(model):
+    model_name = str(type(model)).split(".")[-1]
+    return "".join([char for char in model_name if char not in string.punctuation])

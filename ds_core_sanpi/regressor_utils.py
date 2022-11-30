@@ -1,17 +1,18 @@
 import matplotlib.pyplot as plt
-import multiprocessing
 import numpy as np
 import pandas as pd
+import pingouin as pg
 import seaborn as sns
 import shap
+import string
 import time
 from azureml.core import Run
 from catboost import CatBoostRegressor
-from concurrent import futures 
 from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMRegressor
-from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_squared_log_error, mean_absolute_percentage_error
+from pathos.helpers import cpu_count
+from pathos.pools import ProcessPool
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
 from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.linear_model import LinearRegression, Lasso, Ridge
@@ -34,13 +35,13 @@ class Regressor:
         "RFR": RandomForestRegressor(random_state=42),
         "Bagging": BaggingRegressor(random_state=42),
         "Extra": ExtraTreesRegressor(random_state=42),
-        "CatBoost": CatBoostRegressor(loss_function='RMSE', silent=True, random_state=42)
+        "CatBoost": CatBoostRegressor(silent=True, random_state=42)
     }
 
     def __init__(self, data, keep_cols, target, online=False, verbose=True):
         """ construction of Regressor class 
         """
-        self.data = data
+        self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + [target]))) + [target]]
         self.target = target
         self.keep_cols = keep_cols
         if verbose:
@@ -54,7 +55,7 @@ class Regressor:
     def split_x_and_y(self, verbose=True):
         """ split target from the data 
         """
-        self.features = list(set(self.data.columns.tolist()) - set(self.keep_cols) - set([self.target]))
+        self.features = sorted(list(set(self.data.columns.tolist()) - set(self.keep_cols + [self.target])))
         if verbose:
             print("Training will be done using the following features:\n", self.features)
         self.X = self.data[self.features].copy()
@@ -124,48 +125,44 @@ class Regressor:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
     ### SCORE MODELS ###
-    def experiment_models(self, cv=5, ratio_reg=False, calc_col=""):
-        """ experiment the bunch of regression models for the problem
+    def experiment_models(self, cv=5, transform="", ref_col=None, in_test=False):
+        """ check model performances with parallel computing
         """
-        # check model performances with parallel computing
-        cores = multiprocessing.cpu_count()
-        workers = round(cores/2)
-        df_scores = pd.DataFrame(columns = ['model', 'MAE', 'RMSE', 'R2', 'MAPE'])
-        with futures.ProcessPoolExecutor(max_workers=workers) as executor:
-            jobs = {}
-            for model, model_instantiation in self.dict_regressors.items():
-                try:
-                    print(f'Model {model} is training:')
-                    job = executor.submit(self.cv_score_model, model_instantiation, cv, ratio_reg, calc_col)
-                except Exception as e:
-                     print(model, "raises an exception while traning:", e)
-                     continue
-                jobs[job] = model
-                time.sleep(1)  # this is just to make the output look nicer                
-            for job in futures.as_completed(jobs):
-                model = jobs[job]
-                try:
-                    scores = job.result()
-                    print(f"{model} scores:")
-                    [print('\t', key,':', val) for key, val in scores.items()]
-                    if self.online_run:
-                        [self.run.log(f"{key}:", val) for key, val in scores.items()]       
-                    score_entry = {'model': model, 'MAE': scores["MAE"], 
-                                   'RMSE': scores["RMSE"], 'R2': scores["R2"], 'MAPE': scores["MAPE"]}
-                    df_scores = df_scores.append(score_entry, ignore_index = True)
-                except Exception as e:
-                     print(model, "raises an exception while scoring:", e)
-                     continue
-        # sort score dataframe by MAPE
-        df_scores.sort_values('MAPE', ascending=True, inplace=True)
+        cores = cpu_count()
+        pool = ProcessPool(cores)
+        model_names = list(self.dict_regressors.keys())
+        models = list(self.dict_regressors.values())
+        # experiment bunch of regression models
+        print(f"Running models parallel with {cores} cores:", model_names)
+        n_models = len(models)
+        try:
+            if in_test == True:
+                scores_data = pool.amap(self.cv_score_model, models, model_names, [transform] * n_models, [ref_col] * n_models)
+            else:
+                scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models, [transform] * n_models, [ref_col] * n_models)
+            while not scores_data.ready():
+                time.sleep(5); print(".", end=' ')
+            scores_data = scores_data.get()
+        except Exception as e:
+            print(f"\nCouldn't run parallel because of the following exception:", e)
+            scores_data = []
+            for m_name, model in self.dict_regressors.items():
+                if in_test == True:
+                    scores_data.append(self.cv_score_model(model, m_name, transform, ref_col))
+                else:
+                    scores_data.append(self.cv_score_model(model, m_name, cv, transform, ref_col))      
+        df_scores = pd.DataFrame(scores_data)     
+        # sort score dataframe by R2
+        df_scores.sort_values('R2', ascending=False, inplace=True)
         # best models => base models for stacking
         self.base_models = [(df_scores.iloc[0].model, self.dict_regressors[df_scores.iloc[0].model]),
                             (df_scores.iloc[1].model, self.dict_regressors[df_scores.iloc[1].model]),
                             (df_scores.iloc[2].model, self.dict_regressors[df_scores.iloc[2].model])]
         # set best model
         self.best_model = self.base_models[0]
+        return df_scores
 
-    def cv_score_model(self, model=None, cv=5, ratio_reg=False, calc_col=""):
+    def cv_score_model(self, model=None, model_name="", cv=5, transform="", ref_col=None):
         """ do a cross validation scoring with given model if no 
             model is given then a logistic regression will be tried
         """
@@ -174,6 +171,8 @@ class Regressor:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
+        if model_name == "":
+            model_name = extract_model_name(model)
         elif model == "lr":
             model = LinearRegression()
         elif model == "best":
@@ -186,17 +185,16 @@ class Regressor:
         self.model = model
         y = self.y.copy()
         pred_test = self.pred_test.copy()
-        if ratio_reg:            
-            pred_test = self.X[calc_col] / pred_test
-            y = self.X[calc_col] / y
-        scores = {}
-        scores["MAE"] = round(mean_absolute_error(y, pred_test), 3)  
-        scores["RMSE"] = round(mean_squared_error(y, pred_test, squared=False), 3) 
-        scores["R2"] = round(r2_score(y, pred_test), 3)    
-        scores["MAPE"] = round(mean_absolute_percentage_error(y, pred_test), 3) 
-        return scores
+        if transform == "ratio":            
+            pred_test = self.X[ref_col] / pred_test
+            y = self.X[ref_col] / y
+        elif transform == "log": 
+            pred_test = np.exp(pred_test)
+            y = np.exp(y)           
+        scores = regression_metrics(y, pred_test, model_name)
+        return scores    
 
-    def score_in_test(self, model=None, ratio_reg=False, calc_col=""):
+    def score_in_test(self, model=None, model_name="", transform="", ref_col=None):
         """ score the given regression model on the generated test data
         """
         if hasattr(self, 'X_train'):
@@ -205,6 +203,8 @@ class Regressor:
                     model = self.model
                 else:
                     raise AssertionError("Please pass over a model to proceed!")
+            if model_name == "":
+                model_name = extract_model_name(model)
             elif model == "lr":
                 model = LinearRegression()
             elif model == "best":
@@ -218,14 +218,13 @@ class Regressor:
             self.model = model
             y_test = self.y_test.copy()
             pred_test = self.pred_test.copy()
-            if ratio_reg:            
-                pred_test = self.X_test[calc_col] / pred_test
-                y_test = self.X_test[calc_col] / y_test
-            scores = {}
-            scores["MAE"] = round(mean_absolute_error(y_test, pred_test), 3)  
-            scores["RMSE"] = round(mean_squared_error(y_test, pred_test, squared=False), 3) 
-            scores["R2"] = round(r2_score(y_test, pred_test), 3)    
-            scores["MAPE"] = round(mean_absolute_percentage_error(y_test, pred_test), 3) 
+            if transform == "ratio":          
+                pred_test = self.X_test[ref_col] / pred_test
+                y_test = self.X_test[ref_col] / y_test
+            elif transform == "log": 
+                pred_test = np.exp(pred_test)
+                y_test = np.exp(y_test) 
+            scores = regression_metrics(y_test, pred_test, model_name)
             return scores             
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
@@ -282,12 +281,11 @@ class Regressor:
         print("Model is fit on whole data!")
         self.trained_model = model
 
-    def predict_test(self, test):
+    def predict_test(self):
         """ train the given regression model on whole data
         """   
         if hasattr(self, 'trained_model'): 
-            preds = self.trained_model.predict(test[self.features])
-            return preds
+            return self.trained_model.predict(self.X)
         else:
             raise AssertionError("Please first train a model then predict on the test data!")
 
@@ -311,7 +309,7 @@ class Regressor:
         shap_values = explainer.shap_values(self.X)
         shap.summary_plot(shap_values, self.X, feature_names = important_features)
 
-    def residual_difference(self, lower_threshold=0.4, higher_threshold=2.5, res=0.05, name='', ratio_reg=False, calc_col=""):
+    def residual_difference(self, lower_threshold=0.4, higher_threshold=2.5, res=0.05, name='', transform="", ref_col=None):
         """ show histogram distribution of the ratio between
             selected two continuous columns in the dataframe
             that wanted to be same in ideal case 
@@ -319,68 +317,59 @@ class Regressor:
         if hasattr(self, 'pred_test'): 
             df_ratio = self.data.rename(columns={self.target: "actual"})
             df_ratio["prediction"] = self.pred_test
-            if ratio_reg:            
-                df_ratio["prediction"] = df_ratio[calc_col] / self.pred_test
-                df_ratio["actual"] = df_ratio[calc_col] / self.y
+            if transform == "ratio":          
+                df_ratio["prediction"] = df_ratio[ref_col] / self.pred_test
+                df_ratio["actual"] = df_ratio[ref_col] / self.y
+            elif transform == "log": 
+                df_ratio["prediction"] = np.exp(self.pred_test)
+                df_ratio["actual"] = np.exp(self.y) 
             df_ratio["error"] = df_ratio["prediction"] - df_ratio["actual"]
             df_ratio["percentage_error"] = df_ratio["error"]/df_ratio["actual"] 
             df_ratio["abs_percentage_error"] = round(100*(np.absolute(df_ratio["percentage_error"])), 1) 
-            # regression metrics
-            print("Regression metrics:")
-            metrices = apply_regression_metrics(df_ratio["actual"], df_ratio["prediction"])
-            [print(key,':', val) for key, val in metrices.items()]
-            if self.online_run:
-                [self.run.log(f"{key}:", val) for key, val in metrices.items()]     
-            # counts of observation in different absolute percentage errors
-            percentage_errors = [5, 10, 15, 25, 50]
-            print("\nNumber of observations wrt. absolute percentage errors:")
-            [print(f'<={val}%:', df_ratio[df_ratio["abs_percentage_error"] <= val].shape[0]) for val in percentage_errors]
-            # take the ratio
             df_ratio["ratio"] = df_ratio["prediction"] / df_ratio["actual"]
-            df_ratio_ = df_ratio[(df_ratio["ratio"] > lower_threshold) & (df_ratio["ratio"] < higher_threshold)]
-            # set evaluation criteria based on absolute percentage errors
+            df_ratio_ = df_ratio[(df_ratio["ratio"] > lower_threshold) & (df_ratio["ratio"] < higher_threshold)]    
+
+            # number of observations per percentage error
+            percentage_errors = [5, 10, 15, 25, 50]
+            print("Number of observations per percentage error:")
+            [print(f'\t<={val}%:', df_ratio[df_ratio["abs_percentage_error"] <= val].shape[0]) for val in percentage_errors]
             df_ratio["evaluation"] = df_ratio["abs_percentage_error"].apply(evaluate)
 
+            fig, axes = plt.subplots(3, 2, figsize=(18, 21))
             # 1. histogram distribution
-            plt.figure(figsize=(12, 9))
+            plt.figure(figsize=(24, 27))
             sns.histplot(data=df_ratio.iloc[df_ratio_.index], x="ratio", hue="evaluation", binwidth=res,
                          palette={"5%":  "#205072", 
                                   "10%": "#33709c", 
                                   "15%": "#329D9C",
                                   "25%": "#56C596",
                                   "50%": "#7BE495",
-                                  "off": "#CFF4D2"}, hue_order = ["5%", "10%", "15%", "25%", "50%", "off"])
-            plt.show()
-            # save figure if on cloud
-            if self.online_run:
-                filename=f'./outputs/histplot_{name}.png'
-                plt.savefig(filename, dpi=600)
-                plt.close()
-
-            # 2. regression plot of the ratio
-            """plt.figure(figsize=(12, 9))
-            ax = sns.regplot(x=df_ratio['actual'], y=df_ratio['ratio'], order=2)
-            ax.set_xlabel('target value')
-            ax.set_ylabel('residual ratio')
-            plt.show()    
-            # save figure if on cloud
-            if self.online_run:
-                filename=f'./outputs/regplot_{name}.png'
-                plt.savefig(filename, dpi=600)
-                plt.close()   """  
-
-            # 3. plot regression plot in colors
-            plt.figure(figsize=(12, 9))
+                                  "off": "#CFF4D2"}, hue_order = ["5%", "10%", "15%", "25%", "50%", "off"], ax=axes[0][0])
+            axes[0][0].set(xlabel='Ratio', ylabel='Count', title='Histogram Distribution of Ratio')
+            # 2. plot regression plot in colors
             palette={"5%":  "#1c3e5c",  
                      "10%": "#224b6e",
                      "15%": "#306896", 
                      "25%": "#41739c",
                      "50%": "#679bc7",
                      "off": "#caddee"}
-            ax = sns.regplot(x=df_ratio['prediction'], y=df_ratio['actual'], order=2)
-            ax = sns.scatterplot(data=df_ratio, x="prediction", y="actual", hue="evaluation", palette=palette, hue_order = ["5%", "10%", "15%", "25%", "50%", "off"])
-            ax.set_xlabel('prediction')
-            ax.set_ylabel('target value')
+            sns.regplot(x=df_ratio['prediction'], y=df_ratio['actual'], order=2, ax=axes[0][1])
+            sns.scatterplot(data=df_ratio, x="prediction", y="actual", hue="evaluation", palette=palette, hue_order = ["5%", "10%", "15%", "25%", "50%", "off"], ax=axes[0][1])
+            axes[0][1].set(xlabel='Predicted', ylabel='Target', title='Regression Line')
+            # 3. plot predictions vs residuals 
+            sns.regplot(x=df_ratio["prediction"], y=df_ratio["error"], color='b', order=2, ax=axes[1][0])
+            axes[1][0].set(xlabel='Predicted', ylabel='Residual', title='Predictions vs Residuals')
+            # 4. plot predictions vs percentage error
+            sns.regplot(x=df_ratio["prediction"], y=df_ratio["percentage_error"], color='b', order=2, ax=axes[1][1])
+            axes[1][1].set(xlabel='Predicted', ylabel='Ratio Residual', title='Predictions vs Ratio Residuals')
+            # 5. plot qq plot of residuals
+            pg.qqplot(df_ratio["error"], dist='norm', ax=axes[2][0]) # figsize=(12,9)
+            axes[2][0].set(title='QQ-Plot of Residuals')
+            # 6. plot qq plot of percentage error
+            pg.qqplot(df_ratio["percentage_error"], dist='norm', ax=axes[2][1])
+            axes[2][1].set(title='QQ-Plot of Ratio Residuals')
+            
+            fig.tight_layout()
             plt.show()
             # save figure if on cloud
             if self.online_run:
@@ -391,15 +380,6 @@ class Regressor:
             return df_ratio
         else:
             raise AssertionError("Please first have predictions to check the distribution and scoring metrics!")
-
-    def reg_plot(self):
-        """ relationship btw. predicted and actual values
-        """
-        plt.figure(figsize=(15, 12))
-        ax = sns.regplot(x=self.pred_test, y=self.y, order=2)
-        ax.set_xlabel('prediction')
-        ax.set_ylabel('target value')
-        plt.show()
 
     ### QUANTILE REGRESSION ###
     def quantile_regression(self, postprocessing, threshold_interval, quantiles=[0.5, 0.01, 0.05, 0.075, 0.1, 0.125, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]): 
@@ -499,55 +479,9 @@ class Regressor:
         results.loc[cond, highest_col] = results.loc[cond, "best_prediction"] + threshold_interval/2
         results[interval_col] = results[highest_col] - results[lowest_col]
         return results
-        
-    ### REGRESSION ON CLASSES ###
-    def classification_score_metrics(self):
-        """ show relevant classification score metrics for the test data
-        """
-        if hasattr(self, 'pred_test'):  
-            metrices = apply_classification_metrics(self.y, self.pred_test)
-            [print(key,':', val) for key, val in metrices.items()]
-            if self.online_run:
-                [self.run.log(f"{key}:", val) for key, val in metrices.items()]
-        else:
-            raise AssertionError("Please first have predictions to check scoring metrics!")
-    
-    def classification_confusion_matrix(self, name=""):
-        """ confusion matrix of the classification 
-        """
-        if hasattr(self, 'pred_test'): 
-            labels = [(int(i)) for i in sorted(self.y.unique().tolist())]
-            apply_confusion_matrix(self.y, self.pred_test, labels, self.online_run, name)
-        else:
-            raise AssertionError("Please first train a model and do predictions!")
-            
+                    
 
-### AUXILIARY FUNCTIONS ###
-def apply_confusion_matrix(y_test, pred_test, labels, online_run, name):
-    """ confusion matrix of the classification 
-    """
-    cf_matrix = confusion_matrix(y_test, pred_test, labels=labels)
-    cf_matrix_percentage = cf_matrix.astype('float') / cf_matrix.sum(axis=1)[:, np.newaxis]            
-    sns.set(rc={'figure.figsize':(10, 18)})
-    fig, axs = plt.subplots(nrows=2)
-    fig.suptitle(f"Confusion Matrix", fontsize=20)
-    g1 = sns.heatmap(cf_matrix, annot=True, fmt='g', cmap='Blues', ax=axs[0])
-    g2 = sns.heatmap(cf_matrix_percentage, annot=True, fmt='.1%', cmap='Blues', ax=axs[1])
-    g1.set_xlabel('Predicted Values')
-    g1.set_ylabel('Actual Values ')
-    g1.xaxis.set_ticklabels(labels)
-    g1.yaxis.set_ticklabels(labels)
-    g2.set_xlabel('Predicted Values')
-    g2.set_ylabel('Actual Values ')
-    g2.xaxis.set_ticklabels(labels)
-    g2.yaxis.set_ticklabels(labels)
-    plt.show()
-    if online_run:
-        # save figure
-        filename=f'./outputs/confusion_matrix_{name}.png'
-        plt.savefig(filename, dpi=600)
-        plt.close()
-    
+### AUXILIARY FUNCTIONS ###    
 def evaluate(x):
     """ evaluation intervals of the residual ratio between
         two continious features
@@ -566,44 +500,19 @@ def evaluate(x):
         value = "5%"
     return value
 
-def apply_regression_metrics(y_test, pred_test):
+def regression_metrics(y_test, pred_test, model_name=""):
     """ show metrics for selected two continuous columns to be
         compared with each other 
     """   
-    metrices = {
-        'MAE': mean_absolute_error(y_test, pred_test),
-        'RMSE': mean_squared_error(y_test, pred_test, squared=False),
-        'R2': r2_score(y_test, pred_test),
-        'LOG': np.sqrt(mean_squared_log_error(y_test, pred_test)),
-        'MAPE': mean_absolute_percentage_error(y_test, pred_test),
-        'samples_test': len(y_test),    
+    return {
+        'model' : model_name,
+        'R2': round(r2_score(y_test, pred_test), 3),
+        'MAE': round(mean_absolute_error(y_test, pred_test), 3),
+        'MAPE': round(mean_absolute_percentage_error(y_test, pred_test), 3),
+        'RMSE': round(mean_squared_error(y_test, pred_test, squared=False), 3),
+        'sample_size': len(y_test),    
     }
-    return metrices
 
-def apply_classification_metrics(y_test, pred_test):
-    """ show relevant classification score metrics for the test data
-    """  
-    metrices = {
-        'mean_relative_error': round(mean_relative_error(y_test, pred_test), 3),
-        'mean_abs_error': round(mean_abs_error(y_test, pred_test), 3),
-        'accuracy':  round(accuracy_score(y_test, pred_test), 3),
-        'precision': round(precision_score(y_test, pred_test, average="weighted"), 3),
-        'recall':    round(recall_score(y_test, pred_test, average="weighted"), 3),
-        'f1_value':  round(f1_score(y_test, pred_test, average="weighted"), 3),
-        'samples_test': len(y_test),    
-    }
-    return metrices
-
-def mean_relative_error(y_true, y_pred, drop_inf=True):
-    re = np.abs(y_true - y_pred)/y_true
-    if drop_inf:
-        mre = np.sum(re[re != np.inf])/len(re[re != np.inf])
-    else:
-        mre = np.sum(re)/len(re)
-    return mre
-
-def mean_abs_error(y_true, y_pred):
-    return np.sum(np.abs(y_true - y_pred))/len(y_true)
-
-def accuracy_score(y_true, y_pred):
-    return sum(y_pred==y_true)/len(y_true)
+def extract_model_name(model):
+    model_name = str(type(model)).split(".")[-1]
+    return "".join([char for char in model_name if char not in string.punctuation])
