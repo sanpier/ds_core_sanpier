@@ -61,13 +61,13 @@ class EDA_Preprocessor:
         num_cols = [i for i in object_cols if all(data[data[i].notnull()][i].apply(lambda x: str(x).isnumeric()))]
         data[num_cols] = data[num_cols].apply(lambda x: pd.to_numeric(x, errors='coerce'), axis=0) 
         # categorical ones
-        self.categorical_cols = list(set(object_cols) - set(num_cols) - set(drop_cols) - set(keep_cols) - set([target_col]))
+        self.categorical_cols = sorted(list(set(object_cols) - set(num_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
         # convert bool to integer and define binary columns
         self.binary_cols = data.columns[data.isin([0,1,np.nan]).all()].tolist()
-        self.binary_cols = list(set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col]))
+        self.binary_cols = sorted(list(set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
         # numeric columns
         numeric_cols = data.select_dtypes(include=np.number).columns.tolist()
-        self.numeric_cols = list(set(numeric_cols) - set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col]))
+        self.numeric_cols = sorted(list(set(numeric_cols) - set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
         # report columns
         print("EDA_Preprocessor instance initialized with data:\n",
              f"\tKeeping columns: {len(self.keep_cols)}\n",
@@ -75,10 +75,9 @@ class EDA_Preprocessor:
              f"\tCategorical features: {len(self.categorical_cols)}\n",
              f"\tBinary features: {len(self.binary_cols)}")
         # set the final columns and data
+        all_cols = keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
         if self.target != "": 
-            all_cols = keep_cols + sorted(self.numeric_cols) + sorted(self.binary_cols) + sorted(self.categorical_cols) + [self.target]
-        else:
-            all_cols = keep_cols + sorted(self.numeric_cols) + sorted(self.binary_cols) + sorted(self.categorical_cols)
+            all_cols = all_cols + [self.target]
         self.df = data[all_cols]
         self.df.reset_index(inplace=True, drop=True)
         print("EDA data is now as follows:")
@@ -185,49 +184,8 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("Target needs to be a continuous numeric feature!")
 
-    def value_count_distributions(self, cols=None, name=""):
-        """ show count plots of given columns in dataframe 
-        """
-        if cols is None:  
-            cols = self.categorical_cols
-        nrows = int(len(cols) / 3) + 1
-        _, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
-        for ax, col in zip(axes.ravel()[:len(cols)], cols):
-            labels = self.df[col].value_counts().index
-            sns.countplot(x=col, 
-                          data=self.df, 
-                          palette="Set3", 
-                          order=labels, 
-                          ax=ax)
-            if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())):
-                ax.set_xticklabels(labels, rotation=45)
-            ax.set_xlabel(col)
-            ax.set_ylabel('counts')
-
-            # show mean target 
-            if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
-                temp = self.df[self.target].groupby(self.df[col]).agg(['mean', 'size']).reset_index().sort_values(by=['size'], ascending=False)
-                temp[col] = temp[col].astype("object")
-                temp = temp.set_index(col).loc[labels].reset_index()
-                ax2 = ax.twinx()
-                ax2.scatter(temp.index, temp['mean'], color='m', label='avg. target')
-                ax2.set_ylim() # 0, 0.5
-                ax2.tick_params(axis='y', colors='m')
-                if ax == axes[0, 0]: 
-                    ax2.legend(loc='upper right')
-        for ax in axes.ravel()[len(cols):]:
-            ax.set_visible(False)
-        plt.tight_layout(w_pad=1)
-        plt.suptitle(f'Value Counts Distributions', fontsize=20, y=1.02)
-        plt.show()
-        if self.online_run:
-            # save figure
-            filepath=f'./outputs/value_count_distributions_{name}.png'
-            plt.savefig(filepath, dpi=600)
-            plt.close() 
-
-    def numeric_distributions(self, cols=None, method='kde', hue=None, name=""):
-        """ show distribution of given columns in given methodology 
+    def feature_distributions(self, cols=None, method='kde', hue=None, name=""):
+        """ show distribution of given numeric columns in given methodology 
             wrt. given hue value, or without a hue value
         """
         if hue == "target":
@@ -235,43 +193,51 @@ class EDA_Preprocessor:
                 raise AssertionError("Hue value can't be the target for regression problems!")
             hue = self.target
         if cols is None:  
-            cols = self.numeric_cols
+            cols = self.numeric_cols + self.categorical_cols + self.binary_cols
         nrows = int(len(cols) / 3) + 1
         fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
-        for ax, feature in zip(axes.ravel()[:len(cols)], cols):
-            if method == 'kde':
-                sns.kdeplot(data=self.df, x=feature, hue=hue, ax=ax)
-            elif method == 'cdf':
-                sns.ecdfplot(data=self.df, x=feature, hue=hue, ax=ax)
-            elif method == 'hist':
-                sns.histplot(data=self.df, x=feature, hue=hue, ax=ax, stat="count", discrete=True)
-            elif method == 'box':
-                if hue == None:
-                    sns.boxplot(data=self.df, x=feature, ax=ax)
-                else:
-                    temp = self.df[[feature, hue]]
-                    temp[hue] = temp[hue].astype(str)
-                    sns.boxplot(data=temp, x=hue, y=feature, ax=ax)
-                    del temp
-                    gc.collect()
-            elif method == 'bar':
-                if hue == None:
-                    sns.barplot(data=self.df, x=feature, ax=ax)
-                else:
-                    temp = self.df.copy()
-                    temp['counts'] = 1
-                    temp = temp.groupby([hue, feature], as_index=False).agg({'counts':'sum'})
-                    sns.barplot(data=temp, x=feature, y='counts', hue=hue, ax=ax)
-                    del temp
-                    gc.collect()
+        for ax, col in zip(axes.ravel()[:len(cols)], cols):
+            if col in self.numeric_cols:
+                # numeric distribution
+                if method == 'kde':
+                    sns.kdeplot(data=self.df, x=col, hue=hue, ax=ax, common_norm=False)
+                elif method == 'cdf':
+                    sns.ecdfplot(data=self.df, x=col, hue=hue, ax=ax)
+                elif method == 'hist':
+                    sns.histplot(data=self.df, x=col, alpha=0.8, hue=hue, ax=ax, common_norm=False, stat="density", discrete=True)
+                elif method == 'box':
+                    sns.boxplot(data=self.df, x=hue, y=col, ax=ax) 
+                    if hue:
+                        ax.set_xlabel(hue) 
+            else:
+                # categoric distribution
+                labels = self.df[col].value_counts().index
+                sns.countplot(x=col, data=self.df, palette="Set3", order=labels, ax=ax)
+                if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())) | \
+                    (pd.Series(labels).apply(lambda x: len(str(x))).max() == 1):
+                    ax.set_xticklabels(labels, rotation=45)
+                ax.set_xlabel(col)
+                ax.set_ylabel('counts')
+                # average of target for each category
+                if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
+                    temp = self.df[self.target].groupby(self.df[col]).agg(['mean', 'size']).reset_index().sort_values(by=['size'], ascending=False)
+                    temp[col] = temp[col].astype("object")
+                    temp = temp.set_index(col).loc[labels].reset_index()
+                    ax2 = ax.twinx()
+                    ax2.scatter(temp.index, temp['mean'], color='m', label='avg. target')
+                    ax2.set_ylim() # 0, 0.5
+                    ax2.tick_params(axis='y', colors='m')
+                    if ax == axes[0, 0]: 
+                        ax2.legend(loc='upper right')
         for ax in axes.ravel()[len(cols):]:
             ax.set_visible(False)
         fig.tight_layout()
+        #plt.suptitle(f'Distributions', fontsize=20, y=1.02)
         plt.show()
         if self.online_run:
             filepath=f'./outputs/numeric_distributions_{name}.png'
             plt.savefig(filepath, dpi=600)
-            plt.close() 
+            plt.close()   
 
     def rolling_window_correlation_plot(self, cols=None, name=""):
         """ rolling window correlation of given columns with respect to target
@@ -281,7 +247,7 @@ class EDA_Preprocessor:
                 cols = self.numeric_cols
             nrows = int(len(cols) / 3) + 1
             fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
-            rolling_num = round(len(self.df) / 25)
+            rolling_num = round(len(self.df) / 5)
             for ax, feature in zip(axes.ravel()[:len(cols)], cols):
                 temp = self.df.sort_values(feature)
                 temp.reset_index(inplace=True)
@@ -300,46 +266,52 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("The target variable should be numeric to use this function!")
 
-    def compare_distributions_in_two_data(self, df, cols=None, method="hist", name=""):
-        """ histogram or qq plot distributions of the given columns in two datasets:
-            check whether distribution of the same columns are similar or not 
-            in two datasets
+    def compare_two_data(self, df, cols=None, method="cdf", name=""):
+        """ checking whether distributions of the given columns are similar 
+            or not in two datasets
         """
         if cols is None:  
-            cols = self.numeric_cols
+            cols = self.numeric_cols + self.categorical_cols + self.binary_cols
+        temp = pd.concat([self.df[cols], df[cols]], axis=0).reset_index(drop=True)
+        temp["label"] = pd.Series(["1st data"] * len(self.df) + ["2nd data"] * len(df))
         nrows = int(len(cols) / 3) + 1
         _, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
         for ax, col in zip(axes.ravel()[:len(cols)], cols):
-            if method == "hist":
-                mi = min(self.df[col].min(), df[col].min())
-                ma = max(self.df[col].max(), df[col].max())
-                bins = np.linspace(mi, ma, 50)
-                ax.hist(self.df[col], bins=bins, alpha=0.5, density=True, label='1st df')
-                ax.hist(df[col], bins=bins, alpha=0.5, density=True, label='2nd df')
+            if col in self.numeric_cols:
+                # numeric distribution
+                if method == 'kde':
+                    sns.kdeplot(data=temp, x=col, hue="label", ax=ax, common_norm=False)
+                elif method == 'cdf':
+                    sns.ecdfplot(data=temp, x=col, hue="label", ax=ax)
+                elif method == 'hist':
+                    sns.histplot(data=temp, x=col, alpha=0.8, hue="label", ax=ax, common_norm=False, stat="density", discrete=True)
+                elif method == 'box':
+                    sns.boxplot(data=temp, x="label", y=col, ax=ax)  
+                    ax.set_xlabel("datasets")   
+                elif method == "qqplot":
+                    pp_x = sm.ProbPlot(self.df[col])
+                    pp_y = sm.ProbPlot(df[col])
+                    qqplot_2samples(pp_x, pp_y, f"{col} quantiles in 1st data", f"{col} quantiles in 2nd data", line="45", ax=ax)      
+            else:     
+                # categoric distribution
+                labels = temp[col].value_counts().index          
+                sns.countplot(x=col, data=temp, order=labels, hue="label", ax=ax)
+                if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())) | \
+                    (pd.Series(labels).apply(lambda x: len(str(x))).max() == 1):
+                    ax.set_xticklabels(labels, rotation=45)
                 ax.set_xlabel(col)
-                if ax == axes[0, 0]: 
-                    ax.legend(loc='lower left')
-            elif method == "qqplot":
-                pp_x = sm.ProbPlot(self.df[col])
-                pp_y = sm.ProbPlot(df[col])
-                qqplot_2samples(pp_x, pp_y, f"{col} quantiles in 1st data", f"{col} quantiles in 2nd data", line="45", ax=ax)
-            elif method == "bar":
-                temp = pd.concat([self.df[cols], df[cols]], axis=0).reset_index(drop=True)
-                temp["label"] = pd.Series(["1st data"] * len(self.df) + ["2nd data"] * len(df))
-                temp['counts'] = 1
-                temp = temp.groupby(["label", col], as_index=False).agg({'counts':'sum'})
-                sns.barplot(data=temp, x=col, y='counts', hue="label", ax=ax)
-                del temp
-                gc.collect()
+                ax.set_ylabel('counts')
         for ax in axes.ravel()[len(cols):]:
             ax.set_visible(False)
         plt.tight_layout(w_pad=1)
-        plt.suptitle('1st and 2nd data distributions of the given features', fontsize=20, y=1.02)
+        plt.suptitle('Distribution comparison of two data', fontsize=20, y=1.02)
         plt.show()
         if self.online_run:
             filepath=f'./outputs/qqplot_{name}.png'
             plt.savefig(filepath, dpi=600)
             plt.close() 
+        del temp
+        gc.collect()
     
     ### IMPUTATION FUNTIONS & FILL MISSING VALUES ###
     def count_nulls(self, threshold = 50):
