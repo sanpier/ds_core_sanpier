@@ -1,6 +1,7 @@
 import gc
 import math
 import matplotlib.pyplot as plt
+import missingno as msno
 import numpy as np
 import pandas as pd
 import pingouin as pg
@@ -14,6 +15,7 @@ from category_encoders import TargetEncoder, LeaveOneOutEncoder, WOEEncoder
 from classifier_utils import Classifier, classification_metrics
 from lightgbm import LGBMRegressor, LGBMClassifier
 from lofo import LOFOImportance, FLOFOImportance, Dataset, plot_importance
+from natsort import natsorted
 from regressor_utils import Regressor, regression_metrics
 from scipy import stats
 from scipy.stats import norm
@@ -61,13 +63,13 @@ class EDA_Preprocessor:
         num_cols = [i for i in object_cols if all(data[data[i].notnull()][i].apply(lambda x: str(x).isnumeric()))]
         data[num_cols] = data[num_cols].apply(lambda x: pd.to_numeric(x, errors='coerce'), axis=0) 
         # categorical ones
-        self.categorical_cols = sorted(list(set(object_cols) - set(num_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
+        self.categorical_cols = natsorted(list(set(object_cols) - set(num_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
         # convert bool to integer and define binary columns
         self.binary_cols = data.columns[data.isin([0,1,np.nan]).all()].tolist()
-        self.binary_cols = sorted(list(set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
+        self.binary_cols = natsorted(list(set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
         # numeric columns
         numeric_cols = data.select_dtypes(include=np.number).columns.tolist()
-        self.numeric_cols = sorted(list(set(numeric_cols) - set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
+        self.numeric_cols = natsorted(list(set(numeric_cols) - set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
         # report columns
         print("EDA_Preprocessor instance initialized with data:\n",
              f"\tKeeping columns: {len(self.keep_cols)}\n",
@@ -75,7 +77,7 @@ class EDA_Preprocessor:
              f"\tCategorical features: {len(self.categorical_cols)}\n",
              f"\tBinary features: {len(self.binary_cols)}")
         # set the final columns and data
-        all_cols = keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
+        all_cols = self.keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
         if self.target != "": 
             all_cols = all_cols + [self.target]
         self.df = data[all_cols]
@@ -111,6 +113,18 @@ class EDA_Preprocessor:
               f"\tNumeric features: {len(self.numeric_cols)}\n",
               f"\tCategorical features: {len(self.categorical_cols)}\n",
               f"\tBinary features: {len(self.binary_cols)}")
+
+    def convert_to_categoric(self, cols):
+        """ convert given numeric columns to categorical
+        """
+        self.numeric_cols = natsorted(list(set(self.numeric_cols).difference(set(cols))))
+        self.categorical_cols = natsorted(list(set(self.categorical_cols).union(set(cols))))        
+        for i in cols:
+            self.df[i] = self.df[i].apply(lambda v: str(v) if not pd.isnull(v) else None)
+        all_cols = self.keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
+        if self.target != "": 
+            all_cols = all_cols + [self.target]
+        self.df = self.df[all_cols]
 
     def pca_decomposition(self, number_of_pc=-1, name=""):
         """ PCA decomposition of the data using only the numeric features
@@ -314,57 +328,68 @@ class EDA_Preprocessor:
         gc.collect()
     
     ### IMPUTATION FUNTIONS & FILL MISSING VALUES ###
-    def count_nulls(self, threshold = 50):
-        """ check number of nan values for every column
-        """
-        print("Null value counts per feature:")
-        nans = self.df.isna().sum()
-        print(nans[nans > threshold].sort_values(ascending=False))
-
-    def check_null_vs_target(self, threshold = 50, name=""):
+    def check_missing_values(self, threshold = 50, name=""):
         """ test how target is changing for the samples where the features are null
         """
         if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
-            # start by plotting the bell curve
-            plt.figure(figsize=(12, 4))
-            z_ticks = np.linspace(-3.5, 3.5, 61)
-            pdf = stats.norm.pdf(z_ticks)
-            plt.plot(z_ticks, pdf)
-
-            # what is average of target
-            avg_target_population = self.df[self.target].mean()
-
-            # calculate the conditional average target for every missing feature
-            print('feature                               avg_target              z    p-value')
-            for f in self.df.columns:
-                if self.df[f].isna().sum() > threshold:
+            # missing values
+            nans = self.df.isna().sum()
+            nans = nans[nans > 50].sort_values(ascending=False)
+            if len(nans) > 0:
+                # start by plotting the bell curve
+                plt.figure(figsize=(15, 6))
+                z_ticks = np.linspace(-3.5, 3.5, 61)
+                pdf = stats.norm.pdf(z_ticks)
+                plt.plot(z_ticks, pdf)
+                # what is average of target
+                avg_target_population = self.df[self.target].mean()
+                # calculate the conditional average target for every missing feature
+                print('feature                          #_missing     avg_target         z    p-value')
+                for f in nans.index.tolist():
                     sample_size = self.df[f].isna().sum()
                     avg_target_sample = self.df[self.df[f].isna()][self.target].mean()
                     z = (avg_target_sample - avg_target_population) / (self.df[self.target].std() / np.sqrt(sample_size))
                     plt.scatter([z], [stats.norm.pdf(z)], c='r' if abs(z) > 2 else 'g', s=100)
-                    print(f"{f:30} :           {avg_target_sample:.3f}          {z:5.2f}      {2*stats.norm.cdf(-abs(z)):.3f}")
+                    print(f"{f:30} :   {sample_size:7}        {avg_target_sample:7.3f}     {z:5.2f}      {2*stats.norm.cdf(-abs(z)):.3f}")
                     if abs(z) > 1: plt.annotate(f"{f}: {avg_target_sample:.3f}",
                                                 (z, stats.norm.pdf(z)),
                                                 xytext=(0,10), 
                                                 textcoords='offset points', ha='left' if z > 0 else 'right',
                                                 color='r' if abs(z) > 2 else 'g')
-            # annotate the center (z=0)
-            plt.vlines([0], 0, 0.05, color='g')
-            plt.annotate(f"z_score = 0\naverage target: {avg_target_population:.3f}",
-                                                (0, 0.05),
-                                                xytext=(0,10), 
-                                                textcoords='offset points', ha='center',
-                                                color='g')
-            plt.title('Average target when feature is missing')
-            plt.yticks([])
-            plt.xlabel('z_score')
-            plt.show()
-            if self.online_run:
-                filepath=f'./outputs/null_vs_target_{name}.png'
-                plt.savefig(filepath, dpi=600)
-                plt.close() 
+                # annotate the center (z=0)
+                plt.vlines([0], 0, 0.05, color='g')
+                plt.annotate(f"z_score = 0\naverage target: {avg_target_population:.3f}",
+                                                    (0, 0.05),
+                                                    xytext=(0,10), 
+                                                    textcoords='offset points', ha='center',
+                                                    color='g')
+                plt.title('Average target when feature is missing')
+                plt.yticks([])
+                plt.xlabel('z_score')
+                plt.show()
+                if self.online_run:
+                    filepath=f'./outputs/null_vs_target_{name}.png'
+                    plt.savefig(filepath, dpi=600)
+                    plt.close() 
         else:
-            raise AssertionError("The target variable should be numeric to use this function!")
+            print("The target variable should be numeric to see statistics about target!")
+            print("Null value counts per feature:")
+            nans = self.df.isna().sum()
+            print(nans[nans > threshold].sort_values(ascending=False))
+
+    def nullity_heatmap(self):
+        """ heatmap visualization of nullity correlation 
+            correlation ranges from:
+             + -1: if one variable appears the other definitely does not
+             +  0: variables appearing or not appearing have no effect on one another
+             +  1: if one variable appears the other definitely also does
+        """
+        msno.heatmap(self.df)
+
+    def nullity_dendrogram(self):
+        """ hierarchical clustering algorithm to the variables
+        """
+        msno.dendrogram(self.df, figsize=(20, 8))
 
     def replace_inf_values(self):
         """ get rid of inf values 

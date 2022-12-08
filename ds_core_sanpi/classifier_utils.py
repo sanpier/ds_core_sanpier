@@ -25,14 +25,14 @@ from sklearn.tree import DecisionTreeClassifier
 class Classifier:
 
     dict_classifiers = {
-        "LR": LogisticRegression(random_state=42),
-        "Ridge": RidgeClassifier(random_state=42),
-        "KNC": KNeighborsClassifier(),
-        "SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
-        "GBC": GradientBoostingClassifier(random_state=42),
-        "DTC": DecisionTreeClassifier(random_state=42),
-        "GNB": GaussianNB(),
-        "Bagging": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
+        #"LR": LogisticRegression(random_state=42),
+        #"Ridge": RidgeClassifier(random_state=42),
+        #"KNC": KNeighborsClassifier(),
+        #"SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
+        #"GBC": GradientBoostingClassifier(random_state=42),
+        #"DTC": DecisionTreeClassifier(random_state=42),
+        #"GNB": GaussianNB(),
+        #"Bagging": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
         "LGBMC": LGBMClassifier(random_state=42),
         "RFC": RandomForestClassifier(random_state=42),
         "Extra": ExtraTreesClassifier(max_depth=None, random_state=42),
@@ -287,10 +287,10 @@ class Classifier:
         elif model == "vote":
             model = self.voting_model()
         y = self.y.copy()
-        if (not self.not_categorical_target) & (not model_name.isin(["CatBoostClassifier", "CatBoost"])):
+        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
             y = self.encoded_y.copy()
         self.pred_test = cross_val_predict(model, self.X, y, cv=cv) 
-        if (not self.not_categorical_target) & (not model_name.isin(["CatBoostClassifier", "CatBoost"])):
+        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
             self.pred_test = self.le.inverse_transform(self.pred_test)  
         self.model = model
         scores = classification_metrics(self.y, self.pred_test, score, model_name)  
@@ -318,11 +318,11 @@ class Classifier:
             elif model == "vote":
                 model = self.voting_model()
             y_train = self.y_train 
-            if (not self.not_categorical_target) & (not model_name.isin(["CatBoostClassifier", "CatBoost"])):
+            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
                 y_train = self.encoded_y_train
             model.fit(self.X_train, y_train)
             self.pred_test = model.predict(self.X_test)
-            if (not self.not_categorical_target) & (not model_name.isin(["CatBoostClassifier", "CatBoost"])):
+            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
                 self.pred_test = self.le.inverse_transform(self.pred_test)  
             self.model = model
             scores = classification_metrics(self.y_test, self.pred_test, score, model_name) 
@@ -401,8 +401,9 @@ class Classifier:
             model = self.stacking_model()
         elif model == "vote":
             model = self.voting_model()
+        model_name = extract_model_name(model)
         y = self.y.copy()
-        if (not self.not_categorical_target) & (not (str(type(model)) == "<class 'catboost.core.CatBoostClassifier'>")):
+        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
             y = self.encoded_y.copy()
         model.fit(self.X, y)
         print("Model is fit on whole data!")
@@ -412,7 +413,8 @@ class Classifier:
         """ train the given classification model on whole data
         """   
         if hasattr(self, 'trained_model'): 
-            if (not self.not_categorical_target) & (not (str(type(self.trained_model)) == "<class 'catboost.core.CatBoostClassifier'>")):
+            model_name = extract_model_name(self.trained_model)
+            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
                 preds = self.trained_model.predict(self.X)
                 preds = self.le.inverse_transform(preds)
             else:
