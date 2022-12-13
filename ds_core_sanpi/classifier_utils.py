@@ -242,7 +242,7 @@ class Classifier:
         n_models = len(models)
         try:
             if in_test == True:
-                scores_data = pool.amap(self.cv_score_model, models, model_names, [score] * n_models)
+                scores_data = pool.amap(self.score_in_test, models, model_names, [score] * n_models)
             else:
                 scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models, [score] * n_models)
             while not scores_data.ready():
@@ -251,9 +251,9 @@ class Classifier:
         except Exception as e:
             print(f"\nCouldn't run parallel because of the following exception:", e)
             scores_data = []
-            for m_name, model in self.dict_regressors.items():
+            for m_name, model in self.dict_classifiers.items():
                 if in_test == True:
-                    scores_data.append(self.cv_score_model(model, m_name, score))
+                    scores_data.append(self.score_in_test(model, m_name, score))
                 else:
                     scores_data.append(self.cv_score_model(model, m_name, cv, score))      
         df_scores = pd.DataFrame(scores_data)                 
@@ -409,17 +409,24 @@ class Classifier:
         print("Model is fit on whole data!")
         self.trained_model = model
 
-    def predict_test(self):
-        """ train the given classification model on whole data
+    def predict_test(self, df):
+        """ predict the given data with the trained model
+            and return the same data including predictions
         """   
+        # align data
+        try:
+            df_X = df[self.features]
+        except Exception as e:
+            print("Given data doesn't have the same set of features as training!")
         if hasattr(self, 'trained_model'): 
             model_name = extract_model_name(self.trained_model)
             if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
-                preds = self.trained_model.predict(self.X)
+                preds = self.trained_model.predict(df_X)
                 preds = self.le.inverse_transform(preds)
             else:
-                preds = self.trained_model.predict(self.X).astype(int)
-            return preds
+                preds = self.trained_model.predict(df_X)
+            df["prediction"] = preds
+            return df
         else:
             raise AssertionError("Please first train a model then predict on the test data!")
 

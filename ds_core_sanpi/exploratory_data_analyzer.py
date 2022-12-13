@@ -10,9 +10,9 @@ import seaborn as sns
 import statsmodels.api as sm
 import warnings
 from azureml.core import Run
-from catboost import CatBoostRegressor
 from category_encoders import TargetEncoder, LeaveOneOutEncoder, WOEEncoder
 from classifier_utils import Classifier, classification_metrics
+from collections import defaultdict
 from lightgbm import LGBMRegressor, LGBMClassifier
 from lofo import LOFOImportance, FLOFOImportance, Dataset, plot_importance
 from natsort import natsorted
@@ -20,14 +20,10 @@ from regressor_utils import Regressor, regression_metrics
 from scipy import stats
 from scipy.stats import norm
 from sklearn.decomposition import PCA
-from sklearn.ensemble import ExtraTreesRegressor, RandomForestRegressor, GradientBoostingRegressor
-from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier
 from sklearn.experimental import enable_iterative_imputer
-from sklearn.impute import KNNImputer, IterativeImputer
+from sklearn.impute import IterativeImputer
 from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
-from sklearn.metrics import confusion_matrix, make_scorer, accuracy_score, recall_score, precision_score, roc_auc_score, f1_score
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_squared_log_error, mean_absolute_percentage_error
-from sklearn.model_selection import cross_val_predict, KFold
+from sklearn.model_selection import cross_val_predict
 from statsmodels.graphics.gofplots import qqplot_2samples
 warnings.filterwarnings("ignore")
 
@@ -559,15 +555,18 @@ class EDA_Preprocessor:
         df_ground_truth = self.df[self.df[self.target].notnull()]
         for cat in categories:
             if self.df[self.df[col] == cat].shape[0] > value_threshold:
-                self.df.loc[self.df[col] == cat, col] = df_ground_truth.loc[df_ground_truth[col] == cat, self.target].mean()
+                value = df_ground_truth.loc[df_ground_truth[col] == cat, self.target].mean()
             else:
-                self.df.loc[self.df[col] == cat, col] = df_ground_truth[self.target].mean()
+                value = df_ground_truth[self.target].mean()
+            self.df.loc[self.df[col] == cat, col] = value
+            self.dict_encoder[col][cat] = value
         self.df[col] = self.df[col].astype("float")
 
     def target_encoding(self, category_threshold, value_threshold, all_of_them=False):
         """ target encode all categorical columns 
         """
         if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
+            self.dict_encoder = defaultdict(dict)
             if all_of_them==False:
                 # dummifiction
                 dummy_cols = [col for col in self.categorical_cols if len(self.df[col].unique()) <= category_threshold]
@@ -586,6 +585,7 @@ class EDA_Preprocessor:
                 for category_col in self.categorical_cols:
                     self.target_encoding_on_column(category_col, value_threshold)
                     print(category_col, "is target encoded now!")
+            return dict(self.dict_encoder)
         else:
             raise AssertionError("The classification problem is not applicable for target encoding!")
 
