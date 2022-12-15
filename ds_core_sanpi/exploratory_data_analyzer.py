@@ -340,13 +340,13 @@ class EDA_Preprocessor:
                 # what is average of target
                 avg_target_population = self.df[self.target].mean()
                 # calculate the conditional average target for every missing feature
-                print('feature                          #_missing     avg_target         z    p-value')
+                print('feature                                         #_missing     avg_target         z    p-value')
                 for f in nans.index.tolist():
                     sample_size = self.df[f].isna().sum()
                     avg_target_sample = self.df[self.df[f].isna()][self.target].mean()
                     z = (avg_target_sample - avg_target_population) / (self.df[self.target].std() / np.sqrt(sample_size))
                     plt.scatter([z], [stats.norm.pdf(z)], c='r' if abs(z) > 2 else 'g', s=100)
-                    print(f"{f:30} :   {sample_size:7}        {avg_target_sample:7.3f}     {z:5.2f}      {2*stats.norm.cdf(-abs(z)):.3f}")
+                    print(f"{f:45} :   {sample_size:7}        {avg_target_sample:7.3f}     {z:5.2f}      {2*stats.norm.cdf(-abs(z)):.3f}")
                     if abs(z) > 1: plt.annotate(f"{f}: {avg_target_sample:.3f}",
                                                 (z, stats.norm.pdf(z)),
                                                 xytext=(0,10), 
@@ -387,7 +387,7 @@ class EDA_Preprocessor:
         """
         msno.dendrogram(self.df, figsize=(20, 8))
 
-    def replace_inf_values(self):
+    def replace_inf_values(self, value=None):
         """ get rid of inf values 
         """
         df = self.df[self.numeric_cols]
@@ -397,10 +397,14 @@ class EDA_Preprocessor:
         print("Infinity value columns: ")
         for i in col_name:
             print(f"\tfixing column {i}:", np.isinf(df[col_name]).values.sum())
-            max_value = self.df[~self.df[i].isin([np.inf])][i].max()
-            min_value = self.df[~self.df[i].isin([-np.inf])][i].min()
-            self.df[i] = np.where(self.df[i].isin([np.inf]), max_value, self.df[i]) 
-            self.df[i] = np.where(self.df[i].isin([-np.inf]), min_value, self.df[i]) 
+            if value:
+                self.df[i] = np.where(self.df[i].isin([np.inf]), value, self.df[i]) 
+                self.df[i] = np.where(self.df[i].isin([-np.inf]), value, self.df[i]) 
+            else:
+                max_value = self.df[~self.df[i].isin([np.inf])][i].max()
+                min_value = self.df[~self.df[i].isin([-np.inf])][i].min()
+                self.df[i] = np.where(self.df[i].isin([np.inf]), max_value, self.df[i]) 
+                self.df[i] = np.where(self.df[i].isin([-np.inf]), min_value, self.df[i]) 
             
     def fill_missing_values(self, fill_by_zero_cols=None, strategy="mean"):
         """ fill missing numeric values by mean and categorical features 
