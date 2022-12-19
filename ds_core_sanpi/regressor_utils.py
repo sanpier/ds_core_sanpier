@@ -38,32 +38,30 @@ class Regressor:
         "CatBoost": CatBoostRegressor(silent=True, random_state=42)
     }
 
-    def __init__(self, data, keep_cols, target, online=False, verbose=True):
+    def __init__(self, data, keep_cols, target, online=False):
         """ construction of Regressor class 
         """
         self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + [target]))) + [target]]
         self.target = target
         self.keep_cols = keep_cols
-        if verbose:
-            print("Regressor initialized")
-        self.split_x_and_y(verbose)
+        self.split_x_and_y()
+        print("Regressor initialized")
         self.online_run = online
         if self.online_run:
             self.run = Run.get_context()
 
     ### TRAIN / TEST SPLIT ###
-    def split_x_and_y(self, verbose=True):
+    def split_x_and_y(self):
         """ split target from the data 
         """
         self.features = sorted(list(set(self.data.columns.tolist()) - set(self.keep_cols + [self.target])))
-        if verbose:
+        if len(self.features) <= 25:
             print("Training will be done using the following features:\n", self.features)
         self.X = self.data[self.features].copy()
         self.y = self.data[self.target].copy()
-        if verbose:
-            print("Data is split into X and y:\n",
-                  "\tX:", self.X.shape, "\n",
-                  "\ty:", self.y.shape)
+        print("Data is split into X and y:\n",
+                "\tX:", self.X.shape, "\n",
+                "\ty:", self.y.shape)
 
     def generate_train_test(self):
         """ create train test sets for modeling
@@ -137,7 +135,7 @@ class Regressor:
         n_models = len(models)
         try:
             if in_test == True:
-                scores_data = pool.amap(self.cv_score_model, models, model_names, [transform] * n_models, [ref_col] * n_models)
+                scores_data = pool.amap(self.score_in_test, models, model_names, [transform] * n_models, [ref_col] * n_models)
             else:
                 scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models, [transform] * n_models, [ref_col] * n_models)
             while not scores_data.ready():
@@ -148,7 +146,7 @@ class Regressor:
             scores_data = []
             for m_name, model in self.dict_regressors.items():
                 if in_test == True:
-                    scores_data.append(self.cv_score_model(model, m_name, transform, ref_col))
+                    scores_data.append(self.score_in_test(model, m_name, transform, ref_col))
                 else:
                     scores_data.append(self.cv_score_model(model, m_name, cv, transform, ref_col))      
         df_scores = pd.DataFrame(scores_data)     
@@ -171,8 +169,6 @@ class Regressor:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        if model_name == "":
-            model_name = extract_model_name(model)
         elif model == "lr":
             model = LinearRegression()
         elif model == "best":
@@ -181,6 +177,8 @@ class Regressor:
             model = self.stacking_model()
         elif model == "vote":
             model = self.voting_model()
+        if model_name == "":
+            model_name = extract_model_name(model)
         self.pred_test = cross_val_predict(model, self.X, self.y, cv=cv) 
         self.model = model
         y = self.y.copy()
@@ -203,8 +201,6 @@ class Regressor:
                     model = self.model
                 else:
                     raise AssertionError("Please pass over a model to proceed!")
-            if model_name == "":
-                model_name = extract_model_name(model)
             elif model == "lr":
                 model = LinearRegression()
             elif model == "best":
@@ -213,6 +209,8 @@ class Regressor:
                 model = self.stacking_model()
             elif model == "vote":
                 model = self.voting_model()
+            if model_name == "":
+                model_name = extract_model_name(model)
             model.fit(self.X_train, self.y_train)
             self.pred_test = model.predict(self.X_test)
             self.model = model
@@ -281,11 +279,19 @@ class Regressor:
         print("Model is fit on whole data!")
         self.trained_model = model
 
-    def predict_test(self):
-        """ train the given regression model on whole data
+    def predict_test(self df):
+        """ predict the given data with the trained model
+            and return the same data including predictions
         """   
+        # align data
+        try:
+            df_X = df[self.features]
+        except Exception as e:
+            print("Given data doesn't have the same set of features as training!")
         if hasattr(self, 'trained_model'): 
-            return self.trained_model.predict(self.X)
+            model_name = extract_model_name(self.trained_model)
+            df["prediction"] = self.trained_model.predict(df_X)
+            return df
         else:
             raise AssertionError("Please first train a model then predict on the test data!")
 

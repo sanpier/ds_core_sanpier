@@ -13,6 +13,7 @@ from azureml.core import Run
 from category_encoders import TargetEncoder, LeaveOneOutEncoder, WOEEncoder
 from classifier_utils import Classifier, classification_metrics
 from collections import defaultdict
+from featimp import get_feature_importances, display_feature_importances
 from lightgbm import LGBMRegressor, LGBMClassifier
 from lofo import LOFOImportance, FLOFOImportance, Dataset, plot_importance
 from natsort import natsorted
@@ -99,10 +100,11 @@ class EDA_Preprocessor:
         """ drop given columns from the data
         """
         # drop given columns
+        cols = list(set(cols).intersection(set(self.df.columns)))
         self.df.drop(cols, axis=1, inplace=True)
-        self.numeric_cols = list(set(self.numeric_cols) - set(cols))
-        self.categorical_cols = list(set(self.categorical_cols) - set(cols))
-        self.binary_cols = list(set(self.binary_cols) - set(cols))
+        self.numeric_cols = natsorted(list(set(self.numeric_cols) - set(cols)))
+        self.categorical_cols = natsorted(list(set(self.categorical_cols) - set(cols)))
+        self.binary_cols = natsorted(list(set(self.binary_cols) - set(cols)))
         # report columns now
         print(f"Data shape: {self.df.shape}\n",
               f"\tKeeping columns: {len(self.keep_cols)}\n",
@@ -116,7 +118,7 @@ class EDA_Preprocessor:
         self.numeric_cols = natsorted(list(set(self.numeric_cols).difference(set(cols))))
         self.categorical_cols = natsorted(list(set(self.categorical_cols).union(set(cols))))        
         for i in cols:
-            self.df[i] = self.df[i].apply(lambda v: str(v) if not pd.isnull(v) else None)
+            self.df[i] = self.df[i].apply(lambda v: str(int(v)) if not pd.isnull(v) else None)
         all_cols = self.keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
         if self.target != "": 
             all_cols = all_cols + [self.target]
@@ -593,6 +595,15 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("The classification problem is not applicable for target encoding!")
 
+    def apply_target_encoding(self, df, encoder):
+        """ given the dataframe and encoder dictionary this function applies 
+            the categorical encoding to the data provided
+        """
+        # apply target encoding
+        for i in list(encoder.keys()):
+            df[i] = df[i].map(encoder[i])
+        return df
+
     def target_encoding_by_lib(self, method="target"):
         """ target encoding by category_encoders library
         """
@@ -676,16 +687,17 @@ class EDA_Preprocessor:
         # select upper triangle of correlation matrix
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(np.bool))
         # find features with correlation greater than 0.95
-        to_drop = [column for column in upper.columns if any(upper[column] > 0.95)]
-        print("Highly correlated columns are:", to_drop)
+        highly_corr = [column for column in upper.columns if any(upper[column] > 0.95)]
+        print("Highly correlated columns are:", highly_corr)
         # drop features 
         if drop:
-            self.numeric_cols = list(set(self.numeric_cols) - set(to_drop))
-            self.binary_cols = list(set(self.binary_cols) - set(to_drop))
-            self.df.drop(to_drop, axis=1, inplace=True)
+            self.numeric_cols = list(set(self.numeric_cols) - set(highly_corr))
+            self.binary_cols = list(set(self.binary_cols) - set(highly_corr))
+            self.df.drop(highly_corr, axis=1, inplace=True)
             print("Shape becomes:", self.df.shape)
-        if self.online_run & (len(to_drop) > 0):
-            self.run.log_list('Highly correlated columns are:', to_drop)
+        if self.online_run & (len(highly_corr) > 0):
+            self.run.log_list('Highly correlated columns are:', highly_corr)
+        return highly_corr
 
     def heatmap_correlation(self, name=""):
         """ show correlation heatmap of numeric features 
@@ -763,47 +775,37 @@ class EDA_Preprocessor:
         self.test = self.df[self.df[self.target].isnull()]
         self.test.reset_index(drop=True, inplace=True)
 
-    def get_feature_importance(self, number_of_features=-1, name=""):
+    def get_feature_importance(self, model=None, no_features_in_plot=30, name=""):
         """ get feature importance by LGBMClassifier model
         """
         if self.target != "": 
             # split data into X and y haven't been done yet
             if not hasattr(self, 'X'): 
                 self.split_x_and_y()
-            n_features = number_of_features 
-            if number_of_features == -1:
-                n_features = self.df.shape[1]
             # define the model
-            if self.problem == "classification":
-                model = LGBMClassifier(random_state=42) 
-            elif self.problem == "regression":
-                model = LGBMRegressor(random_state=42) 
+            if model is None: 
+                if self.problem == "classification":
+                    model = LGBMClassifier(random_state=42) 
+                elif self.problem == "regression":
+                    model = LGBMRegressor(random_state=42) 
             # fit the model
             model.fit(self.X, self.y)
             # get importances
             importances = model.feature_importances_
             importances = np.round(importances / sum(importances), 4)
-            sorted_idx = importances.argsort()[(-1*n_features):]
+            sorted_idx = importances.argsort()[::-1]
+            df_importance = pd.DataFrame(data={"feature": self.X.columns[sorted_idx].astype(str), "importance": importances[sorted_idx]})
             # summarize feature importance
-            plt.figure(figsize=(np.sqrt(n_features)*2.5, np.sqrt(n_features*1.5)))
-            plt.barh(self.X.columns[sorted_idx].astype(str), importances[sorted_idx])
+            plt.figure(figsize=(15, no_features_in_plot/4))
+            #plt.barh(df_importance.feature[:no_features_in_plot], df_importance.importance[:no_features_in_plot])
+            sns.barplot(x='importance', y='feature', data=df_importance[:no_features_in_plot], orient="h", palette="Set3")
             plt.show()
-            # set important features
-            important_features = self.X.columns[sorted_idx].tolist()
-            unimportant_features = list(set(self.X.columns) - set(important_features))
             if self.online_run:
-                self.run.log_list('Important features', important_features)
                 # save figure
                 filename=f'./outputs/feature_importance_{name}.png'
                 plt.savefig(filename, dpi=600)
                 plt.close()
-            print("Feature importance is calculated, the important features are:\n", important_features)
-            self.df.drop(unimportant_features, axis=1, inplace=True)
-            self.X.drop(unimportant_features, axis=1, inplace=True)
-            self.numeric_cols = list(set(self.numeric_cols) - set(unimportant_features))
-            self.categorical_cols = list(set(self.categorical_cols) - set(unimportant_features))
-            self.binary_cols = list(set(self.binary_cols) - set(unimportant_features))
-            return important_features
+            return df_importance
         else:
             raise AssertionError("Please set a target feature first!")
     
@@ -879,7 +881,24 @@ class EDA_Preprocessor:
             return importance_df
         else:
             raise AssertionError("Please set a target feature first!")
-    
+
+    def get_featimp(self):
+        """ get feature importances using featimp library 
+        """
+        if self.df.isna().sum().sum() > 0:
+            raise AssertionError("Please first impute the missing values of the dataframe!")
+        if self.problem == "regression":
+            task = 'reg'
+        elif self.problem == "classification":
+            task = 'clf_multiable'
+            if self.df[self.target].nunique() == 2:
+                task = 'clf_binary'
+        fi_df = get_feature_importances(data=self.df, num_features=self.numeric_cols, cat_features=self.categorical_cols, 
+                                        target=self.target, task=task, method='all')
+        display_feature_importances(data=fi_df)
+        fi_df = fi_df.reset_index().rename(columns={"index": "feature"})
+        return fi_df
+
 
 ### AUXILIARY FUNCTIONS ###
 def evaluate(x):

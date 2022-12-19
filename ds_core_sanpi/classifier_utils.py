@@ -11,8 +11,8 @@ from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
 from pathos.helpers import cpu_count
 from pathos.pools import ProcessPool
-from sklearn.ensemble import BaggingClassifier, ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier, StackingClassifier, VotingClassifier
-from sklearn.linear_model import LogisticRegression, RidgeClassifier
+from sklearn.ensemble import BaggingClassifier, ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier, StackingClassifier, VotingClassifier, AdaBoostClassifier
+from sklearn.linear_model import LinearRegression, LogisticRegression, RidgeClassifier, SGDClassifier
 from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, precision_score, f1_score, roc_auc_score
 from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.naive_bayes import GaussianNB
@@ -25,55 +25,54 @@ from sklearn.tree import DecisionTreeClassifier
 class Classifier:
 
     dict_classifiers = {
-        #"LR": LogisticRegression(random_state=42),
-        #"Ridge": RidgeClassifier(random_state=42),
-        #"KNC": KNeighborsClassifier(),
-        #"SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
-        #"GBC": GradientBoostingClassifier(random_state=42),
-        #"DTC": DecisionTreeClassifier(random_state=42),
-        #"GNB": GaussianNB(),
-        #"Bagging": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
+        "LR": LogisticRegression(random_state=42),
+        "Ridge": RidgeClassifier(random_state=42),
+        "KNC": KNeighborsClassifier(),
+        "SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
+        "GBC": GradientBoostingClassifier(random_state=42),
+        "SGD": SGDClassifier(random_state=42),
+        "DTC": DecisionTreeClassifier(random_state=42),
+        "GNB": GaussianNB(),
+        "Bagging": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
         "LGBMC": LGBMClassifier(random_state=42),
         "RFC": RandomForestClassifier(random_state=42),
+        "Ada": AdaBoostClassifier(random_state=42),
         "Extra": ExtraTreesClassifier(max_depth=None, random_state=42),
         "CatBoost": CatBoostClassifier(silent=True, random_state=42)
     }
     
-    def __init__(self, data, keep_cols, target, online=False, verbose=True):
+    def __init__(self, data, keep_cols, target, online=False):
         """ construction of Classifier class 
         """
         self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + [target]))) + [target]]
         self.target = target
         self.keep_cols = keep_cols
-        self.split_x_and_y(verbose) 
+        self.split_x_and_y() 
         self.not_categorical_target = all(data[data[target].notnull()][target].apply(lambda x: str(x).isnumeric() | isinstance(x, (int, float))))
         if self.not_categorical_target:
             self.labels = [(int(i)) for i in sorted(data[target].unique().tolist())]
         else:
             self.le = LabelEncoder()
             self.encoded_y = self.le.fit_transform(self.y)
-            if verbose:
-                print("Categorical target is label encoded:", pd.Series(self.encoded_y).unique())
+            print("Categorical target is label encoded:", pd.Series(self.encoded_y).unique())
             self.labels = self.le.classes_
-        if verbose:
-            print("Classifier initialized with labels:", self.labels)
+        print("Classifier initialized with labels:", self.labels)
         self.online_run = online
         if self.online_run:
             self.run = Run.get_context()
 
     ### TRAIN / TEST SPLIT ###
-    def split_x_and_y(self, verbose=True):
+    def split_x_and_y(self):
         """ split target from the data 
         """
         self.features = sorted(list(set(self.data.columns.tolist()) - set(self.keep_cols + [self.target])))
-        if verbose:
+        if len(self.features) <= 25:
             print("Training will be done using the following features:\n", self.features)
         self.X = self.data[self.features].copy()
         self.y = self.data[self.target].copy()
-        if verbose:
-            print("Data is split into X and y:\n",
-                "\tX:", self.X.shape, "\n",
-                "\ty:", self.y.shape)
+        print("Data is split into X and y:\n",
+              "\tX:", self.X.shape, "\n",
+              "\ty:", self.y.shape)
 
     def generate_train_test(self):
         """ create train test sets for modeling
@@ -248,6 +247,7 @@ class Classifier:
             while not scores_data.ready():
                 time.sleep(5); print(".", end=' ')
             scores_data = scores_data.get()
+            print("\n")
         except Exception as e:
             print(f"\nCouldn't run parallel because of the following exception:", e)
             scores_data = []
@@ -276,8 +276,6 @@ class Classifier:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        if model_name == "":
-            model_name = extract_model_name(model)
         elif model == "lr":
             model = LogisticRegression(random_state=42)
         elif model == "best":
@@ -286,6 +284,8 @@ class Classifier:
             model = self.stacking_model()
         elif model == "vote":
             model = self.voting_model()
+        if model_name == "":
+            model_name = extract_model_name(model)
         y = self.y.copy()
         if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
             y = self.encoded_y.copy()
@@ -307,8 +307,6 @@ class Classifier:
                     model = self.model
                 else:
                     raise AssertionError("Please pass over a model to proceed!")
-            if model_name == "":
-                model_name = extract_model_name(model)
             elif model == "lr":
                 model = LogisticRegression(random_state=42)
             elif model == "best":
@@ -317,6 +315,8 @@ class Classifier:
                 model = self.stacking_model()
             elif model == "vote":
                 model = self.voting_model()
+            if model_name == "":
+                model_name = extract_model_name(model)
             y_train = self.y_train 
             if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
                 y_train = self.encoded_y_train
@@ -332,7 +332,7 @@ class Classifier:
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
         
-    def probability_prediction(self, model=None, cv=5):
+    def cv_probability_prediction(self, model=None, cv=5):
         """ do a cross validation predictions with probabilities
         """
         if model is None:
@@ -351,7 +351,8 @@ class Classifier:
         y = self.y.copy()
         if not self.not_categorical_target:
             y = self.encoded_y.copy()
-        return cross_val_predict(model, self.X, y, cv=cv, method='predict_proba')
+        prob_pred = cross_val_predict(model, self.X, y, cv=cv, method='predict_proba')
+        return pd.Series(map(lambda i: tuple(i), prob_pred))
 
     ### ENSEMBL MODELS ### 
     def define_base_models(self, base_list):
@@ -383,6 +384,74 @@ class Classifier:
             return final_model
         else:
             raise AssertionError("Please first experiment models to set top 3 base models!")
+
+    def cv_ensemble_models(self, models, score="weighted", confusion=False):
+        """ create a ensemble of different classifiers manually given 
+            a list of models
+        """
+        self.ensemble_models = models
+        df_preds = pd.DataFrame(self.y)
+        binary = self.data[self.target].nunique() == 2
+        # individual model predictions
+        for model in models:
+            model_name = ''.join([char for char in extract_model_name(model) if char.isupper()])
+            print(model_name, "scores\t:", self.cv_score_model(model=model, score=score))
+            df_preds[f"{model_name.lower()}_pred"] = self.pred_test
+            if binary:
+                df_preds[f"{model_name.lower()}_pred_proba"] = self.cv_probability_prediction(model=model)
+            if confusion:
+                apply_confusion_matrix(self.y, self.pred_test, self.labels)
+        # prepare proba columns
+        if binary:
+            pred_proba_cols = [i for i in df_preds.columns if i.endswith("_pred_proba")]
+            for col_i in pred_proba_cols:
+                df_preds[col_i] = df_preds[col_i].apply(lambda x: x[1]) # Is 1 the target always?
+        # meta model
+        meta_model = LinearRegression()
+        pred_cols = [i for i in df_preds.columns if i.endswith("_pred")]
+        meta_model.fit(df_preds[pred_cols], df_preds[self.target])
+        coefs = dict(zip(pred_cols, meta_model.coef_/meta_model.coef_.sum()))
+        print("Model coefficients:")
+        print(coefs)
+        self.ensemble_coefficients = coefs
+        # combined predicitons
+        if binary:
+            df_preds["final_pred_proba"] = sum([df_preds[f"{i}_proba"]*coefs[i] for i in coefs.keys()])
+            df_preds["final_pred"] = df_preds["final_pred_proba"].apply(lambda x: 1 if x >= 0.5 else 0)
+        else:
+            df_preds["final_pred"] = sum([df_preds[i]*coefs[i] for i in coefs.keys()]).apply(round)
+        print("Ensemble scores\t:", classification_metrics(df_preds[self.target], df_preds.final_pred, score=score))
+        if confusion:
+            apply_confusion_matrix(df_preds[self.target], df_preds.final_pred, [0,1])
+        return df_preds
+
+    def predict_test_by_ensemble(self, df):
+        """ do prediction by ensembling the given models
+        """
+        if hasattr(self, 'ensemble_models'): 
+            # train models and do individual predictions
+            binary = self.data[self.target].nunique() == 2
+            df_preds_test = pd.DataFrame()
+            for model in self.ensemble_models:
+                model_name = ''.join([char for char in extract_model_name(model) if char.isupper()])
+                print(model_name, "training...")
+                self.train_model(model)
+                df_ = self.predict_test(df)
+                df_preds_test[f"{model_name.lower()}_pred"] = df_["prediction"]
+                df_preds_test[f"{model_name.lower()}_pred_proba"] = df_["prediction_prob"]
+            # final prediciton
+            if binary:
+                pred_proba_cols = [i for i in df_preds_test.columns if i.endswith("_pred_proba")]
+                for col_i in pred_proba_cols:
+                    df_preds_test[col_i] = df_preds_test[col_i].apply(lambda x: float(x[1])) # Is 1 the target always?
+                df_preds_test["final_pred_proba"] = sum([df_preds_test[f"{i}_proba"]*self.ensemble_coefficients[i] for i in self.ensemble_coefficients.keys()])
+                df_preds_test["final_pred"] = df_preds_test["final_pred_proba"].apply(lambda x: 1 if x >= 0.5 else 0)
+            else:      
+                df_preds_test["final_pred"] = sum([df_preds_test[i]*self.ensemble_coefficients[i] for i in self.ensemble_coefficients.keys()]).apply(round)
+            return df_preds_test
+        else:
+            raise AssertionError("Please first call cv_ensemble_models method and pass your models!")
+
 
     ### TRAIN GIVEN MODEL & PREDICT GIVEN TEST ###
     def train_model(self, model=None):
@@ -420,12 +489,11 @@ class Classifier:
             print("Given data doesn't have the same set of features as training!")
         if hasattr(self, 'trained_model'): 
             model_name = extract_model_name(self.trained_model)
+            preds = self.trained_model.predict(df_X)
             if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
-                preds = self.trained_model.predict(df_X)
                 preds = self.le.inverse_transform(preds)
-            else:
-                preds = self.trained_model.predict(df_X)
             df["prediction"] = preds
+            df["prediction_prob"] = pd.Series(map(lambda i: tuple(i), self.trained_model.predict_proba(df_X)))
             return df
         else:
             raise AssertionError("Please first train a model then predict on the test data!")
