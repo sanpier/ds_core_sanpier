@@ -279,7 +279,7 @@ class Regressor:
         print("Model is fit on whole data!")
         self.trained_model = model
 
-    def predict_test(self df):
+    def predict_test(self, df):
         """ predict the given data with the trained model
             and return the same data including predictions
         """   
