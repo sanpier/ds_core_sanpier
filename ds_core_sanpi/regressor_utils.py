@@ -12,13 +12,16 @@ from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMRegressor
 from pathos.helpers import cpu_count
 from pathos.pools import ProcessPool
+from sklearn.kernel_ridge import KernelRidge
+from sklearn.linear_model import LinearRegression, Lasso, Ridge, ElasticNet
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.neighbors import KNeighborsRegressor
-from sklearn.linear_model import LinearRegression, Lasso, Ridge
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.svm import SVR
 from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, BaggingRegressor, StackingRegressor, VotingRegressor
+from xgboost import XGBRegressor
 
 
 class Regressor:
@@ -27,9 +30,12 @@ class Regressor:
         "LR": LinearRegression(),
         "Ridge": Ridge(random_state=42),
         "Lasso": Lasso(random_state=42),
+        "ENet": ElasticNet(random_state=42),
+        "KRR": KernelRidge(),
         "KNC": KNeighborsRegressor(),
         "SVR": SVR(), # kernel == 'poly' | 'linear' | 'sigmoid'
         "GBR": GradientBoostingRegressor(random_state=42),
+        "XGBR": XGBRegressor(random_state=42),
         "LGBMR": LGBMRegressor(random_state=42),
         "DTR": DecisionTreeRegressor(random_state=42),
         "RFR": RandomForestRegressor(random_state=42),
@@ -38,14 +44,24 @@ class Regressor:
         "CatBoost": CatBoostRegressor(silent=True, random_state=42)
     }
 
-    def __init__(self, data, keep_cols, target, online=False):
+    def __init__(self, data, keep_cols, target, transform=None, ref_col=None, online=False):
         """ construction of Regressor class 
         """
-        self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + [target]))) + [target]]
+        if type(target) == list:
+            self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + target))) + target]
+            self.problem = "multi_output"
+        else:
+            self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + [target]))) + [target]]
+            self.problem = "single_output"
         self.target = target
+        self.transform = transform
+        self.ref_col = ref_col
         self.keep_cols = keep_cols
         self.split_x_and_y()
-        print("Regressor initialized")
+        if self.problem == "single_output":
+            print("Regressor initialized")
+        else:
+            print("Multi-output regressor initialized")
         self.online_run = online
         if self.online_run:
             self.run = Run.get_context()
@@ -54,7 +70,10 @@ class Regressor:
     def split_x_and_y(self):
         """ split target from the data 
         """
-        self.features = sorted(list(set(self.data.columns.tolist()) - set(self.keep_cols + [self.target])))
+        if self.problem == "multi_output":
+            self.features = sorted(list(set(self.data.columns.tolist()) - set(self.keep_cols + self.target)))
+        else:
+            self.features = sorted(list(set(self.data.columns.tolist()) - set(self.keep_cols + [self.target])))
         if len(self.features) <= 25:
             print("Training will be done using the following features:\n", self.features)
         self.X = self.data[self.features].copy()
@@ -123,7 +142,7 @@ class Regressor:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
     ### SCORE MODELS ###
-    def experiment_models(self, cv=5, transform="", ref_col=None, in_test=False):
+    def experiment_models(self, cv=5, in_test=False):
         """ check model performances with parallel computing
         """
         cores = cpu_count()
@@ -135,9 +154,9 @@ class Regressor:
         n_models = len(models)
         try:
             if in_test == True:
-                scores_data = pool.amap(self.score_in_test, models, model_names, [transform] * n_models, [ref_col] * n_models)
+                scores_data = pool.amap(self.score_in_test, models, model_names)
             else:
-                scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models, [transform] * n_models, [ref_col] * n_models)
+                scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models)
             while not scores_data.ready():
                 time.sleep(5); print(".", end=' ')
             scores_data = scores_data.get()
@@ -146,9 +165,9 @@ class Regressor:
             scores_data = []
             for m_name, model in self.dict_regressors.items():
                 if in_test == True:
-                    scores_data.append(self.score_in_test(model, m_name, transform, ref_col))
+                    scores_data.append(self.score_in_test(model, m_name))
                 else:
-                    scores_data.append(self.cv_score_model(model, m_name, cv, transform, ref_col))      
+                    scores_data.append(self.cv_score_model(model, m_name, cv))      
         df_scores = pd.DataFrame(scores_data)     
         # sort score dataframe by R2
         df_scores.sort_values('R2', ascending=False, inplace=True)
@@ -160,7 +179,7 @@ class Regressor:
         self.best_model = self.base_models[0]
         return df_scores
 
-    def cv_score_model(self, model=None, model_name="", cv=5, transform="", ref_col=None):
+    def cv_score_model(self, model=None, model_name="", cv=5):
         """ do a cross validation scoring with given model if no 
             model is given then a logistic regression will be tried
         """
@@ -179,20 +198,22 @@ class Regressor:
             model = self.voting_model()
         if model_name == "":
             model_name = extract_model_name(model)
+        if self.problem == "multi_output":
+            model = MultiOutputRegressor(model)
         self.pred_test = cross_val_predict(model, self.X, self.y, cv=cv) 
         self.model = model
         y = self.y.copy()
         pred_test = self.pred_test.copy()
-        if transform == "ratio":            
-            pred_test = self.X[ref_col] / pred_test
-            y = self.X[ref_col] / y
-        elif transform == "log": 
+        if self.transform == "ratio":            
+            pred_test = self.X[self.ref_col] / pred_test
+            y = self.X[self.ref_col] / y
+        elif self.transform == "log": 
             pred_test = np.exp(pred_test)
             y = np.exp(y)           
         scores = regression_metrics(y, pred_test, model_name)
         return scores    
 
-    def score_in_test(self, model=None, model_name="", transform="", ref_col=None):
+    def score_in_test(self, model=None, model_name=""):
         """ score the given regression model on the generated test data
         """
         if hasattr(self, 'X_train'):
@@ -211,22 +232,107 @@ class Regressor:
                 model = self.voting_model()
             if model_name == "":
                 model_name = extract_model_name(model)
+            if self.problem == "multi_output":
+                model = MultiOutputRegressor(model)
             model.fit(self.X_train, self.y_train)
             self.pred_test = model.predict(self.X_test)
             self.model = model
             y_test = self.y_test.copy()
             pred_test = self.pred_test.copy()
-            if transform == "ratio":          
-                pred_test = self.X_test[ref_col] / pred_test
-                y_test = self.X_test[ref_col] / y_test
-            elif transform == "log": 
+            if self.transform == "ratio":          
+                pred_test = self.X_test[self.ref_col] / pred_test
+                y_test = self.X_test[self.ref_col] / y_test
+            elif self.transform == "log": 
                 pred_test = np.exp(pred_test)
                 y_test = np.exp(y_test) 
             scores = regression_metrics(y_test, pred_test, model_name)
             return scores             
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
-       
+
+    def scores_for_multi_output(self):
+        """ score multi-output regression predictions individually
+        """
+        if hasattr(self, 'pred_test'): 
+            if self.problem == "multi_output":
+                y = self.y.copy()
+                pred_test = self.pred_test.copy()
+                if hasattr(self, 'X_train'):
+                    y = self.y_test.copy()
+                    if self.transform == "ratio": 
+                        for i in range(self.y.shape[1]):
+                            pred_test[:,i] = self.X_test[self.ref_col] / pred_test[:,i] 
+                            y.iloc[:,i] = self.X_test[self.ref_col] / y.iloc[:,i]
+                    elif self.transform == "log": 
+                        pred_test = np.exp(pred_test)
+                        y = np.exp(y) 
+                else:
+                    if self.transform == "ratio":      
+                        for i in range(self.y.shape[1]):
+                            pred_test[:,i] = self.X[self.ref_col] / pred_test[:,i]  
+                            y.iloc[:,i] = self.X[self.ref_col] / y.iloc[:,i]
+                    elif self.transform == "log": 
+                        pred_test = np.exp(pred_test)
+                        y = np.exp(y)                    
+                return {y.columns[i]: regression_metrics(y.iloc[:,i], pred_test[:,i], extract_model_name(self.model)) for i in range(self.y.shape[1])}
+            else:
+                raise AssertionError("This function only works when using multi-output regression models!")
+        else:
+            raise AssertionError("Please first have predictions of a multi-ouput regression model!")
+
+    def calculate_errors(self, percentage_errors = [5, 10, 15, 25, 50], verbose=False):
+        """ calculate residuals, errors and percentage errors of the 
+            model predictions
+        """
+        if hasattr(self, 'pred_test'): 
+            df_residuals = self.data.copy()
+            if self.problem == "single_output":
+                df_residuals = df_residuals.rename(columns={self.target: "actual"})
+                df_residuals["prediction"] = self.pred_test   
+                # do transformation
+                if self.transform == "ratio":          
+                    df_residuals["prediction"] = df_residuals[self.ref_col] / self.pred_test
+                    df_residuals["actual"] = df_residuals[self.ref_col] / self.y
+                elif self.transform == "log": 
+                    df_residuals["prediction"] = np.exp(self.pred_test)
+                    df_residuals["actual"] = np.exp(self.y) 
+                # calculate errors
+                df_residuals["error"] = df_residuals["prediction"] - df_residuals["actual"]
+                df_residuals["percentage_error"] = df_residuals["error"]/df_residuals["actual"] 
+                df_residuals["abs_percentage_error"] = round(100*(np.absolute(df_residuals["percentage_error"])), 1) 
+                df_residuals["ratio"] = df_residuals["prediction"] / df_residuals["actual"]
+                df_residuals["evaluation"] = df_residuals["abs_percentage_error"].apply(evaluate)
+                if verbose:
+                    print("Number of observations per percentage error:")
+                    [print(f'\t<={val}%:', df_residuals[df_residuals["abs_percentage_error"] <= val].shape[0]) for val in percentage_errors]
+            elif self.problem == "multi_output":
+                for i in range(self.y.shape[1]):
+                    df_residuals[f"actual_{i}"] = self.y.iloc[:,i] 
+                    df_residuals[f"prediction_{i}"] = self.pred_test[:,i]
+                df_residuals.drop(columns=self.target, inplace=True)
+                # do transformation
+                target_cols = [i for i in df_residuals.columns if i.startswith("actual_") | i.startswith("prediction_")]        
+                if self.transform == "ratio": 
+                    for col_i in target_cols:
+                        df_residuals[col_i] = self.X[self.ref_col] / df_residuals[col_i]
+                elif self.transform == "log": 
+                    for col_i in target_cols:
+                        df_residuals[col_i] = np.exp(df_residuals[col_i])
+                # calculate errors
+                for i in range(self.y.shape[1]): 
+                    df_residuals[f"error_{i}"] = df_residuals[f"prediction_{i}"] - df_residuals[f"actual_{i}"]
+                    df_residuals[f"percentage_error_{i}"] = df_residuals[f"error_{i}"]/df_residuals[f"actual_{i}"] 
+                    df_residuals[f"abs_percentage_error_{i}"] = round(100*(np.absolute(df_residuals[f"percentage_error_{i}"])), 1) 
+                    df_residuals[f"ratio_{i}"] = df_residuals[f"prediction_{i}"] / df_residuals[f"actual_{i}"]
+                    df_residuals[f"evaluation_{i}"] = df_residuals[f"abs_percentage_error_{i}"].apply(evaluate)
+                if verbose:
+                    print("Number of observations per percentage error:")
+                    for i in range(self.y.shape[1]):
+                        [print(f'\t<={val}%:', df_residuals[df_residuals[f"abs_percentage_error_{i}"] <= val].shape[0]) for val in percentage_errors]
+            return df_residuals
+        else:
+            raise AssertionError("Please first have predictions to check the distribution and scoring metrics!")
+
     ### ENSEMBL MODELS ### 
     def define_base_models(self, base_list):
         """ give a list of model abbreviations to be used
@@ -257,6 +363,61 @@ class Regressor:
             return final_model
         else:
             raise AssertionError("Please first experiment models to set top 3 base models!")
+
+    def cv_ensemble_models(self, models):
+        """ create a ensemble of different regressors manually given 
+            a list of models
+        """
+        self.ensemble_models = models
+        df_preds = pd.DataFrame(self.y).copy()
+        # individual model predictions
+        for model in models:
+            model_name = ''.join([char for char in extract_model_name(model) if char.isupper()])
+            print(model_name, "scores\t:", self.cv_score_model(model=model, model_name=model_name))
+            if self.problem == "single_output":
+                df_preds[f"{model_name.lower()}_pred"] = self.pred_test
+            elif self.problem == "multi_output":
+                for i in range(self.y.shape[1]):
+                    df_preds[f"{model_name.lower()}_pred_{i}"] = self.pred_test[:,i]
+        # meta model
+        meta_model = LinearRegression()   
+        if self.problem == "single_output":      
+            pred_cols = [i for i in df_preds.columns if i.endswith("_pred")]    
+            meta_model.fit(df_preds[pred_cols], df_preds[self.target])
+            coefs = dict(zip(pred_cols, meta_model.coef_/meta_model.coef_.sum()))
+        elif self.problem == "multi_output": 
+            coefs = {}
+            for i in range(self.y.shape[1]):
+                pred_cols_i = [col_i for col_i in df_preds.columns if col_i.endswith(f"_pred_{i}")] 
+                meta_model.fit(df_preds[pred_cols_i], self.y.iloc[:,i])
+                coefs[i] = dict(zip(pred_cols_i, meta_model.coef_/meta_model.coef_.sum()))
+        print("Model coefficients:")
+        print(coefs)
+        self.ensemble_coefficients = coefs
+        # combined predicitons
+        if self.problem == "single_output":  
+            df_preds["final_pred"] = sum([df_preds[i]*coefs[i] for i in coefs.keys()]) 
+        elif self.problem == "multi_output": 
+            for i in range(self.y.shape[1]):
+                df_preds[f"final_pred_{i}"] = sum([df_preds[j]*coefs[i][j] for j in coefs[i].keys()])    
+        # do transformation
+        pred_cols = [i for i in df_preds.columns if "_pred" in i]        
+        if self.transform == "ratio": 
+            for col_i in pred_cols:
+                df_preds[col_i] = self.X[self.ref_col] / df_preds[col_i]
+            df_preds[self.target] = self.X[self.ref_col] / df_preds[self.target]
+        elif self.transform == "log": 
+            for col_i in pred_cols:
+                df_preds[col_i] = np.exp(df_preds[col_i])
+            df_preds[self.target] = np.exp(df_preds[self.target])
+        # report scores
+        if self.problem == "single_output":              
+            print("Ensemble scores\t:", regression_metrics(df_preds[self.target], df_preds.final_pred, model_name="Ensemble"))
+        elif self.problem == "multi_output":  
+            final_cols = [f"final_pred_{i}" for i in range(self.y.shape[1])]            
+            #[print("Ensemble scores\t:", regression_metrics(df_preds[self.target].iloc[:,i], df_preds[f"final_pred_{i}"], model_name="Ensemble")) for i in range(self.y.shape[1])]
+            print("Ensemble scores\t:", regression_metrics(df_preds[self.target], df_preds[final_cols], model_name="Ensemble"))
+        return df_preds
 
     ### TRAIN GIVEN MODEL & PREDICT GIVEN TEST ###
     def train_model(self, model=None):
@@ -289,7 +450,6 @@ class Regressor:
         except Exception as e:
             print("Given data doesn't have the same set of features as training!")
         if hasattr(self, 'trained_model'): 
-            model_name = extract_model_name(self.trained_model)
             df["prediction"] = self.trained_model.predict(df_X)
             return df
         else:
@@ -315,36 +475,23 @@ class Regressor:
         shap_values = explainer.shap_values(self.X)
         shap.summary_plot(shap_values, self.X, feature_names = important_features)
 
-    def residual_difference(self, lower_threshold=0.4, higher_threshold=2.5, res=0.05, name='', transform="", ref_col=None):
-        """ show histogram distribution of the ratio between
-            selected two continuous columns in the dataframe
-            that wanted to be same in ideal case 
+    def regression_plots(self, lower_threshold=0.4, higher_threshold=2.5, res=0.05, name=''):
+        """ 4 regression plots to understand the prediction vs ground-truth
+            results better
         """
-        if hasattr(self, 'pred_test'): 
-            df_ratio = self.data.rename(columns={self.target: "actual"})
-            df_ratio["prediction"] = self.pred_test
-            if transform == "ratio":          
-                df_ratio["prediction"] = df_ratio[ref_col] / self.pred_test
-                df_ratio["actual"] = df_ratio[ref_col] / self.y
-            elif transform == "log": 
-                df_ratio["prediction"] = np.exp(self.pred_test)
-                df_ratio["actual"] = np.exp(self.y) 
-            df_ratio["error"] = df_ratio["prediction"] - df_ratio["actual"]
-            df_ratio["percentage_error"] = df_ratio["error"]/df_ratio["actual"] 
-            df_ratio["abs_percentage_error"] = round(100*(np.absolute(df_ratio["percentage_error"])), 1) 
-            df_ratio["ratio"] = df_ratio["prediction"] / df_ratio["actual"]
-            df_ratio_ = df_ratio[(df_ratio["ratio"] > lower_threshold) & (df_ratio["ratio"] < higher_threshold)]    
-
-            # number of observations per percentage error
-            percentage_errors = [5, 10, 15, 25, 50]
-            print("Number of observations per percentage error:")
-            [print(f'\t<={val}%:', df_ratio[df_ratio["abs_percentage_error"] <= val].shape[0]) for val in percentage_errors]
-            df_ratio["evaluation"] = df_ratio["abs_percentage_error"].apply(evaluate)
-
-            fig, axes = plt.subplots(3, 2, figsize=(18, 21))
+        df_residuals = self.calculate_errors()  
+        prediction_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"prediction")]
+        actual_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"actual")]
+        error_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"error")]
+        percentage_error_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"percentage_error")]
+        ratio_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"ratio")]
+        evaluation_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"evaluation")]
+        for i in range(len(prediction_cols)):
+            fig, axes = plt.subplots(2, 2, figsize=(18, 14))
             # 1. histogram distribution
-            plt.figure(figsize=(24, 27))
-            sns.histplot(data=df_ratio.iloc[df_ratio_.index], x="ratio", hue="evaluation", binwidth=res,
+            plt.figure(figsize=(24, 18))
+            df_residuals_ = df_residuals[(df_residuals[ratio_cols[i]] > lower_threshold) & (df_residuals[ratio_cols[i]] < higher_threshold)]  
+            sns.histplot(data=df_residuals.iloc[df_residuals_.index], x=ratio_cols[i], hue=evaluation_cols[i], binwidth=res,
                          palette={"5%":  "#205072", 
                                   "10%": "#33709c", 
                                   "15%": "#329D9C",
@@ -359,33 +506,32 @@ class Regressor:
                      "25%": "#41739c",
                      "50%": "#679bc7",
                      "off": "#caddee"}
-            sns.regplot(x=df_ratio['prediction'], y=df_ratio['actual'], order=2, ax=axes[0][1])
-            sns.scatterplot(data=df_ratio, x="prediction", y="actual", hue="evaluation", palette=palette, hue_order = ["5%", "10%", "15%", "25%", "50%", "off"], ax=axes[0][1])
+            sns.regplot(x=df_residuals[prediction_cols[i]], y=df_residuals[actual_cols[i]], order=2, ax=axes[0][1])
+            sns.scatterplot(data=df_residuals, x=prediction_cols[i], y=actual_cols[i], hue=evaluation_cols[i], palette=palette, hue_order = ["5%", "10%", "15%", "25%", "50%", "off"], ax=axes[0][1])
             axes[0][1].set(xlabel='Predicted', ylabel='Target', title='Regression Line')
             # 3. plot predictions vs residuals 
-            sns.regplot(x=df_ratio["prediction"], y=df_ratio["error"], color='b', order=2, ax=axes[1][0])
+            sns.regplot(x=df_residuals[prediction_cols[i]], y=df_residuals[error_cols[i]], color='b', order=2, ax=axes[1][0])
             axes[1][0].set(xlabel='Predicted', ylabel='Residual', title='Predictions vs Residuals')
-            # 4. plot predictions vs percentage error
-            sns.regplot(x=df_ratio["prediction"], y=df_ratio["percentage_error"], color='b', order=2, ax=axes[1][1])
-            axes[1][1].set(xlabel='Predicted', ylabel='Ratio Residual', title='Predictions vs Ratio Residuals')
-            # 5. plot qq plot of residuals
-            pg.qqplot(df_ratio["error"], dist='norm', ax=axes[2][0]) # figsize=(12,9)
-            axes[2][0].set(title='QQ-Plot of Residuals')
+            # 4. plot qq plot of residuals
+            pg.qqplot(df_residuals[error_cols[i]], dist='norm', ax=axes[1][1])
+            axes[1][1].set(title='QQ-Plot of Residuals')
+            # 5. plot predictions vs percentage error
+            #sns.regplot(x=df_residuals[prediction_cols[i]], y=df_residuals[percentage_error_cols[i]], color='b', order=2, ax=axes[2][0])
+            #axes[2][0].set(xlabel='Predicted', ylabel='Ratio Residual', title='Predictions vs Ratio Residuals')
             # 6. plot qq plot of percentage error
-            pg.qqplot(df_ratio["percentage_error"], dist='norm', ax=axes[2][1])
-            axes[2][1].set(title='QQ-Plot of Ratio Residuals')
-            
+            #pg.qqplot(df_residuals[percentage_error_cols[i]], dist='norm', ax=axes[2][1])
+            #axes[2][1].set(title='QQ-Plot of Ratio Residuals')
+            if len(prediction_cols) == 1:
+                fig.suptitle(f"Prediction vs {self.target}", fontsize=16)
+            else:
+                fig.suptitle(f"Prediction vs {self.target[i]}", fontsize=16)
             fig.tight_layout()
             plt.show()
             # save figure if on cloud
             if self.online_run:
-                filename=f'./outputs/regplot_{name}.png'
+                filename=f'./outputs/regplot_{name}_{i}.png'
                 plt.savefig(filename, dpi=600)
                 plt.close()
-
-            return df_ratio
-        else:
-            raise AssertionError("Please first have predictions to check the distribution and scoring metrics!")
 
     ### QUANTILE REGRESSION ###
     def quantile_regression(self, postprocessing, threshold_interval, quantiles=[0.5, 0.01, 0.05, 0.075, 0.1, 0.125, 0.15, 0.2, 0.25, 0.3, 0.35, 0.4]): 

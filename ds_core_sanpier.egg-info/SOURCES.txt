@@ -1,0 +1,15 @@
+LICENSE.txt
+README.md
+pyproject.toml
+setup.cfg
+setup.py
+ds_core_sanpi/__init__.py
+ds_core_sanpi/classifier_utils.py
+ds_core_sanpi/exploratory_data_analyzer.py
+ds_core_sanpi/regressor_utils.py
+ds_core_sanpier.egg-info/PKG-INFO
+ds_core_sanpier.egg-info/SOURCES.txt
+ds_core_sanpier.egg-info/dependency_links.txt
+ds_core_sanpier.egg-info/not-zip-safe
+ds_core_sanpier.egg-info/requires.txt
+ds_core_sanpier.egg-info/top_level.txt

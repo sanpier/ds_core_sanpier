@@ -78,6 +78,9 @@ class EDA_Preprocessor:
         if self.target != "": 
             all_cols = all_cols + [self.target]
         self.df = data[all_cols]
+        if (self.target != "") & (self.df[self.df[self.target].isnull()].shape[0] > 0): 
+            self.df = self.df[self.target.notnull()]
+            print("Rows with null target values are dropped:", self.df.shape)
         self.df.reset_index(inplace=True, drop=True)
         print("EDA data is now as follows:")
         print(self.df.info())
@@ -179,22 +182,24 @@ class EDA_Preprocessor:
                     }, ignore_index=True)
         return outlier_df
 
-    def target_distribution(self, name=""):
-        """ show target value distribution vs gaussian
+    def distribution_vs_gaussian(self, col=None, name=""):
+        """ show the distribution of given column vs gaussian
+            if no column given then check for the target column
         """     
-        if (self.problem == "regression"):  
-            _, axes = plt.subplots(1, 2, figsize=(20, 7))
-            sns.distplot(self.df[self.target], fit=norm, ax=axes[0])
-            axes[0].set(title='Distribution of target vs Gaussian')
-            pg.qqplot(self.df[self.target], dist='norm', ax=axes[1]) 
-            axes[1].set(title='QQ-Plot of Target')
-            if self.online_run:
-                # save figure
-                filepath=f'./outputs/target_distribution_{name}.png'
-                plt.savefig(filepath, dpi=600)
-                plt.close() 
-        else:
-            raise AssertionError("Target needs to be a continuous numeric feature!")
+        if col is None:
+            col = self.target
+            if self.problem != "regression":  
+                raise AssertionError("Target needs to be a continuous numeric feature!")
+        _, axes = plt.subplots(1, 2, figsize=(20, 7))
+        sns.distplot(self.df[col], fit=norm, ax=axes[0])
+        axes[0].set(title='Distribution of target vs Gaussian')
+        pg.qqplot(self.df[col], dist='norm', ax=axes[1]) 
+        axes[1].set(title='QQ-Plot of Target')
+        if self.online_run:
+            # save figure
+            filepath=f'./outputs/distribution_vs_gaussian_{name}.png'
+            plt.savefig(filepath, dpi=600)
+            plt.close() 
 
     def feature_distributions(self, cols=None, method='kde', hue=None, name=""):
         """ show distribution of given numeric columns in given methodology 
@@ -205,7 +210,13 @@ class EDA_Preprocessor:
                 raise AssertionError("Hue value can't be the target for regression problems!")
             hue = self.target
         if cols is None:  
-            cols = self.numeric_cols + self.categorical_cols + self.binary_cols
+            cols = self.numeric_cols + self.binary_cols + self.categorical_cols
+        # remove categorical columns with too much unique values
+        cat_cols_nunique = self.df[self.categorical_cols].nunique()
+        too_much_cat_values = cat_cols_nunique[cat_cols_nunique > 10].index.tolist()
+        cols = natsorted([i for i in cols if i in self.numeric_cols]) + \
+               natsorted([i for i in cols if i in self.binary_cols]) +  \
+               natsorted([i for i in cols if (i in self.categorical_cols) & (not i in too_much_cat_values)])
         nrows = int(len(cols) / 3) + 1
         fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
         for ax, col in zip(axes.ravel()[:len(cols)], cols):
@@ -227,7 +238,7 @@ class EDA_Preprocessor:
                 sns.countplot(x=col, data=self.df, palette="Set3", order=labels, ax=ax)
                 if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())) | \
                     (pd.Series(labels).apply(lambda x: len(str(x))).max() == 1):
-                    ax.set_xticklabels(labels, rotation=45)
+                    ax.set_xticklabels(labels, rotation=30)
                 ax.set_xlabel(col)
                 ax.set_ylabel('counts')
                 # average of target for each category
@@ -283,7 +294,14 @@ class EDA_Preprocessor:
             or not in two datasets
         """
         if cols is None:  
-            cols = self.numeric_cols + self.categorical_cols + self.binary_cols
+            cols = self.numeric_cols + self.binary_cols + self.categorical_cols
+        # remove categorical columns with too much unique values
+        cat_cols_nunique = self.df[self.categorical_cols].nunique()
+        too_much_cat_values = cat_cols_nunique[cat_cols_nunique > 10].index.tolist()
+        cols = natsorted([i for i in cols if i in self.numeric_cols]) + \
+               natsorted([i for i in cols if i in self.binary_cols]) +  \
+               natsorted([i for i in cols if (i in self.categorical_cols) & (not i in too_much_cat_values)])
+        # create one data out of both
         temp = pd.concat([self.df[cols], df[cols]], axis=0).reset_index(drop=True)
         temp["label"] = pd.Series(["1st data"] * len(self.df) + ["2nd data"] * len(df))
         nrows = int(len(cols) / 3) + 1
@@ -306,11 +324,11 @@ class EDA_Preprocessor:
                     qqplot_2samples(pp_x, pp_y, f"{col} quantiles in 1st data", f"{col} quantiles in 2nd data", line="45", ax=ax)      
             else:     
                 # categoric distribution
-                labels = temp[col].value_counts().index          
+                labels = temp[col].value_counts().index
                 sns.countplot(x=col, data=temp, order=labels, hue="label", ax=ax)
                 if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())) | \
                     (pd.Series(labels).apply(lambda x: len(str(x))).max() == 1):
-                    ax.set_xticklabels(labels, rotation=45)
+                    ax.set_xticklabels(labels, rotation=30)
                 ax.set_xlabel(col)
                 ax.set_ylabel('counts')
         for ax in axes.ravel()[len(cols):]:
@@ -679,15 +697,15 @@ class EDA_Preprocessor:
         print(self.df[self.numeric_cols].skew().sort_values(ascending=False))
     
     ### CORRELATION FUNCTIONS ###
-    def resolve_correlation(self, drop=True):
+    def resolve_correlation(self, threshold=0.95, drop=False):
         """ remove highly correlated features 
         """
         # create correlation matrix
         corr_matrix = self.df[self.numeric_cols + self.binary_cols].corr().abs().round(2)
         # select upper triangle of correlation matrix
         upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(np.bool))
-        # find features with correlation greater than 0.95
-        highly_corr = [column for column in upper.columns if any(upper[column] > 0.95)]
+        # find features with correlation greater than threshold
+        highly_corr = [column for column in upper.columns if any(upper[column] > threshold)]
         print("Highly correlated columns are:", highly_corr)
         # drop features 
         if drop:
@@ -760,20 +778,14 @@ class EDA_Preprocessor:
         """ split target from the data 
         """
         if self.target != "": 
-            df_ground_truth = self.df[self.df[self.target].notnull()]
-            self.X = df_ground_truth.loc[:, list(set(df_ground_truth.columns) - set(self.keep_cols) - set([self.target]))].copy()
-            self.y = df_ground_truth[self.target].copy()
+            self.X = self.df[self.numeric_cols + self.binary_cols + self.categorical_cols].copy()
+            self.y = self.df[self.target].copy()
             print("ID columns are removed from data:", len(self.keep_cols))
             print("Data is split into X and y:\n",
                   "\tX:", self.X.shape, "\n",
                   "\ty:", self.y.shape)
         else:
             raise AssertionError("Please set a target feature first!")
-
-    def set_test_data(self):
-        """ set test dataset """
-        self.test = self.df[self.df[self.target].isnull()]
-        self.test.reset_index(drop=True, inplace=True)
 
     def get_feature_importance(self, model=None, no_features_in_plot=30, name=""):
         """ get feature importance by LGBMClassifier model
@@ -809,7 +821,7 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("Please set a target feature first!")
     
-    def get_lofo_importance(self, classification_score="weighted", fast=False, recursive_check=False, drop=True):
+    def get_lofo_importance(self, classification_score="weighted", fast=False, recursive_check=False, drop=False):
         """ get feature importance by LOFO
         """
         if self.target != "": 
@@ -875,9 +887,9 @@ class EDA_Preprocessor:
             if drop:
                 self.df.drop(features_to_drop, axis=1, inplace=True)
                 self.X.drop(features_to_drop, axis=1, inplace=True)
-                self.numeric_cols = list(set(self.numeric_cols) - set(features_to_drop))
-                self.categorical_cols = list(set(self.categorical_cols) - set(features_to_drop))
-                self.binary_cols = list(set(self.binary_cols) - set(features_to_drop))
+                self.numeric_cols = natsorted(list(set(self.numeric_cols) - set(features_to_drop)))
+                self.categorical_cols = natsorted(list(set(self.categorical_cols) - set(features_to_drop)))
+                self.binary_cols = natsorted(list(set(self.binary_cols) - set(features_to_drop)))
             return importance_df
         else:
             raise AssertionError("Please set a target feature first!")
@@ -893,7 +905,7 @@ class EDA_Preprocessor:
             task = 'clf_multiable'
             if self.df[self.target].nunique() == 2:
                 task = 'clf_binary'
-        fi_df = get_feature_importances(data=self.df, num_features=self.numeric_cols, cat_features=self.categorical_cols, 
+        fi_df = get_feature_importances(data=self.df, num_features=self.numeric_cols, cat_features=self.binary_cols + self.categorical_cols, 
                                         target=self.target, task=task, method='all')
         display_feature_importances(data=fi_df)
         fi_df = fi_df.reset_index().rename(columns={"index": "feature"})

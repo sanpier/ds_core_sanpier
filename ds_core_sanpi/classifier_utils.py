@@ -395,12 +395,10 @@ class Classifier:
         # individual model predictions
         for model in models:
             model_name = ''.join([char for char in extract_model_name(model) if char.isupper()])
-            print(model_name, "scores\t:", self.cv_score_model(model=model, score=score))
+            print(model_name, "scores\t:", self.cv_score_model(model=model, model_name=model_name, score=score, confusion=confusion))
             df_preds[f"{model_name.lower()}_pred"] = self.pred_test
             if binary:
                 df_preds[f"{model_name.lower()}_pred_proba"] = self.cv_probability_prediction(model=model)
-            if confusion:
-                apply_confusion_matrix(self.y, self.pred_test, self.labels)
         # prepare proba columns
         if binary:
             pred_proba_cols = [i for i in df_preds.columns if i.endswith("_pred_proba")]
@@ -420,7 +418,7 @@ class Classifier:
             df_preds["final_pred"] = df_preds["final_pred_proba"].apply(lambda x: 1 if x >= 0.5 else 0)
         else:
             df_preds["final_pred"] = sum([df_preds[i]*coefs[i] for i in coefs.keys()]).apply(round)
-        print("Ensemble scores\t:", classification_metrics(df_preds[self.target], df_preds.final_pred, score=score))
+        print("Ensemble scores\t:", classification_metrics(df_preds[self.target], df_preds.final_pred, score=score, model_name="Ensemble"))
         if confusion:
             apply_confusion_matrix(df_preds[self.target], df_preds.final_pred, [0,1])
         return df_preds
