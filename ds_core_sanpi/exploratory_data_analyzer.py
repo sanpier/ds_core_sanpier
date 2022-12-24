@@ -619,7 +619,8 @@ class EDA_Preprocessor:
         """
         # apply target encoding
         for i in list(encoder.keys()):
-            df[i] = df[i].map(encoder[i])
+            if i in df.columns:
+                df[i] = df[i].map(encoder[i])
         return df
 
     def target_encoding_by_lib(self, method="target"):
