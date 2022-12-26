@@ -20,7 +20,8 @@ from natsort import natsorted
 from regressor_utils import Regressor, regression_metrics
 from scipy import stats
 from scipy.stats import norm
-from sklearn.decomposition import PCA
+from sklearn.decomposition import PCA, TruncatedSVD
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
@@ -78,9 +79,10 @@ class EDA_Preprocessor:
         if self.target != "": 
             all_cols = all_cols + [self.target]
         self.df = data[all_cols]
-        if (self.target != "") & (self.df[self.df[self.target].isnull()].shape[0] > 0): 
-            self.df = self.df[self.target.notnull()]
-            print("Rows with null target values are dropped:", self.df.shape)
+        if (self.target != ""):
+            if (self.df[self.df[self.target].isnull()].shape[0] > 0): 
+                self.df = self.df[self.target.notnull()]
+                print("Rows with null target values are dropped:", self.df.shape)
         self.df.reset_index(inplace=True, drop=True)
         print("EDA data is now as follows:")
         print(self.df.info())
@@ -88,7 +90,7 @@ class EDA_Preprocessor:
         if self.online_run:
             self.run = Run.get_context()
 
-    ### ENGINEER DATA ###
+    ### COLUMN ENGINEERING ###
     def align_cols(self, cols):
         """ align the dataframe with columns given 
         """
@@ -127,35 +129,114 @@ class EDA_Preprocessor:
             all_cols = all_cols + [self.target]
         self.df = self.df[all_cols]
 
-    def pca_decomposition(self, number_of_pc=-1, name=""):
-        """ PCA decomposition of the data using only the numeric features
+    ### DIMENSIONALITY REDUCTION ###
+    def pca_decomposition(self, cols=None, n_components=-1, name=""):
+        """ PCA decomposition of the data for dimensionality
+            reduction
         """
-        if self.target != "": 
-            pc_size = number_of_pc 
-            if number_of_pc == -1:
-                pc_size = int(math.sqrt(len(self.numeric_cols)))
-            pca = PCA(n_components=pc_size)
-            principalComponents = pca.fit_transform(self.df[self.numeric_cols])
-            pc_columns = ['pc_' + str(i+1) for i in range(pc_size)]
-            principalDf = pd.DataFrame(data = principalComponents, columns = pc_columns)
-            self.df = pd.concat([principalDf, self.df[self.target]], axis = 1)
+        if not hasattr(self, 'decomposition_cols'):
+            self.decomposition_cols = cols
+            if cols is None:  
+                self.decomposition_cols = self.numeric_cols
+        if n_components == -1:
+            n_components = int(math.sqrt(len(self.decomposition_cols)))
+        pca = PCA(n_components=n_components)
+        pca_clusters = pca.fit_transform(self.df[self.decomposition_cols])
+        pca_columns = ['pca_' + str(i+1) for i in range(n_components)]
+        df_pca = pd.DataFrame(data = pca_clusters, columns = pca_columns)
+        self.df = pd.concat([self.df, df_pca], axis = 1)
+        self.numeric_cols = self.numeric_cols + pca_columns
+        print("Size of the new data:", self.df.shape)
+        # explained variance in PCA by plot
+        exp_var = pca.explained_variance_ratio_.round(3)
+        sns.set(rc={'figure.figsize':(2.5*math.sqrt(n_components), 1.5*math.sqrt(n_components))})
+        sns.barplot(y=exp_var, x=pca_columns)
+        plt.show()
+        if self.online_run:
+            # save figure
+            filename=f'./outputs/pca_decomposition_explained_variance_{name}.png'
+            plt.savefig(filename, dpi=600)
+            plt.close()
+        print("Explained variance in PCA:\n", exp_var,
+              "\nTotal variance explained:", sum(exp_var).round(3))
+        return pca
+    
+    def linear_discriminant_analysis(self, cols=None, n_components=-1, name=""):
+        """ Linear discriminant analysis of the data for dimensionality
+            reduction
+        """
+        if self.target != "":
+            if not hasattr(self, 'decomposition_cols'):
+                self.decomposition_cols = cols
+                if cols is None:  
+                    self.decomposition_cols = self.numeric_cols
+            if n_components == -1:
+                n_components = self.df[self.target].nunique()-1
+            print(n_components)
+            lda = LinearDiscriminantAnalysis(n_components=n_components)
+            lda_clusters = lda.fit_transform(self.df[self.decomposition_cols], self.df[self.target])
+            lda_columns = ['lda_' + str(i+1) for i in range(n_components)]
+            df_lda = pd.DataFrame(data = lda_clusters, columns = lda_columns)
+            self.df = pd.concat([self.df, df_lda], axis = 1)
+            self.numeric_cols = self.numeric_cols + lda_columns
             print("Size of the new data:", self.df.shape)
-            # explained variance in PCA by plot
-            exp_var = pca.explained_variance_ratio_.round(3)
-            sns.set(rc={'figure.figsize':(2.5*math.sqrt(pc_size), 1.5*math.sqrt(pc_size))})
-            sns.barplot(y=exp_var, x=pc_columns)
+            # explained variance in LDA by plot
+            exp_var = lda.explained_variance_ratio_.round(3)
+            sns.set(rc={'figure.figsize':(2.5*math.sqrt(n_components), 1.5*math.sqrt(n_components))})
+            sns.barplot(y=exp_var, x=lda_columns)
             plt.show()
             if self.online_run:
                 # save figure
-                filename=f'./outputs/pca_decomposition_explained_variance_{name}.png'
+                filename=f'./outputs/lda_explained_variance_{name}.png'
                 plt.savefig(filename, dpi=600)
                 plt.close()
-            print("Explained variance in PCA:\n", exp_var,
+            print("Explained variance in LDA:\n", exp_var,
                 "\nTotal variance explained:", sum(exp_var).round(3))
-            return pca
+            return lda
         else:
-            raise AssertionError("Please set a target feature first!")
-    
+            raise AssertionError("A target is needed to use this function!")
+
+    def truncated_svd(self, cols=None, n_components=-1, name=""):
+        """ Dimensionality reduction by singular value decomposition
+        """
+        if not hasattr(self, 'decomposition_cols'):
+            self.decomposition_cols = cols
+            if cols is None:  
+                self.decomposition_cols = self.numeric_cols
+        if n_components == -1:
+            n_components = int(math.sqrt(len(self.decomposition_cols)))
+        svd = TruncatedSVD(n_components=n_components)
+        svd_clusters = svd.fit_transform(self.df[self.decomposition_cols])
+        svd_columns = ['svd_' + str(i+1) for i in range(n_components)]
+        df_svd = pd.DataFrame(data = svd_clusters, columns = svd_columns)
+        self.df = pd.concat([self.df, df_svd], axis = 1)
+        self.numeric_cols = self.numeric_cols + svd_columns
+        print("Size of the new data:", self.df.shape)
+        # explained variance in SVD by plot
+        exp_var = svd.explained_variance_ratio_.round(3)
+        sns.set(rc={'figure.figsize':(2.5*math.sqrt(n_components), 1.5*math.sqrt(n_components))})
+        sns.barplot(y=exp_var, x=svd_columns)
+        plt.show()
+        if self.online_run:
+            # save figure
+            filename=f'./outputs/svd_explained_variance_{name}.png'
+            plt.savefig(filename, dpi=600)
+            plt.close()
+        print("Explained variance in SVD:\n", exp_var,
+              "\nTotal variance explained:", sum(exp_var).round(3))
+        return svd
+
+    def apply_dimension_reduction(self, reductor, prefix, decomposition_cols):
+        """ apply dimension reduction to the data by the
+            object that is fit before
+        """
+        clusters = reductor.transform(self.df[decomposition_cols])
+        columns = [f'{prefix}_' + str(i+1) for i in range(reductor.n_components)]
+        df_ = pd.DataFrame(data=clusters, columns=columns)
+        self.df = pd.concat([self.df, df_], axis = 1)
+        self.numeric_cols = self.numeric_cols + columns
+        print("Size of the new data:", self.df.shape)
+
     ### DISTRIBUTION PLOTS ###
     def get_outliers(self, cols=None):
         """ check numeric outliers by percentile analysis
@@ -718,16 +799,17 @@ class EDA_Preprocessor:
             self.run.log_list('Highly correlated columns are:', highly_corr)
         return highly_corr
 
-    def heatmap_correlation(self, name=""):
+    def heatmap_correlation(self, cols=None, name=""):
         """ show correlation heatmap of numeric features 
         """ 
-        if self.target != "": 
-            features = self.numeric_cols + self.binary_cols + [self.target] 
-        else:
-            features = self.numeric_cols + self.binary_cols
-        features = self.df[features].loc[:, self.df[features].nunique() > 1].columns.tolist()
-        unit_size = np.sqrt(len(features)*3)
-        df_analysis = self.df[features].corr().round(2)
+        if cols is None:  
+            if self.target != "": 
+                cols = self.numeric_cols + self.binary_cols + [self.target] 
+            else:
+                cols = self.numeric_cols + self.binary_cols
+        cols = self.df[cols].loc[:, self.df[cols].nunique() > 1].columns.tolist()
+        unit_size = np.sqrt(len(cols)*3)
+        df_analysis = self.df[cols].corr().round(2)
         sns.set(rc={'figure.figsize':(unit_size*3, unit_size*2.5)})
         sns.heatmap(df_analysis, annot=True, cmap="YlOrRd", linewidths=1)
         plt.show()
