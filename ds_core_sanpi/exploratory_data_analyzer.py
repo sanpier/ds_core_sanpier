@@ -22,9 +22,10 @@ from scipy import stats
 from scipy.stats import norm
 from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.ensemble import IsolationForest
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
-from sklearn.preprocessing import LabelEncoder, PowerTransformer, StandardScaler
+from sklearn.preprocessing import LabelEncoder, PowerTransformer, QuantileTransformer, StandardScaler
 from sklearn.model_selection import cross_val_predict
 from statsmodels.graphics.gofplots import qqplot_2samples
 warnings.filterwarnings("ignore")
@@ -89,6 +90,36 @@ class EDA_Preprocessor:
         self.online_run = online_run        
         if self.online_run:
             self.run = Run.get_context()
+
+    ### MEMORY REDUCTION ###
+    def reduce_memory_usage(self):
+        """ reduce memory used by the dataframe by converting into 
+            more memory friendly data types
+        """
+        numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
+        start_mem = self.df.memory_usage().sum() / 1024**2
+        for col in self.df.columns:
+            col_type = self.df[col].dtypes
+            if col_type in numerics:
+                c_min = self.df[col].min()
+                c_max = self.df[col].max()
+                if str(col_type)[:3] == 'int':
+                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                        self.df[col] = self.df[col].astype(np.int8)
+                    elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                        self.df[col] = self.df[col].astype(np.int16)
+                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                        self.df[col] = self.df[col].astype(np.int32)
+                    elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                        self.df[col] = self.df[col].astype(np.int64)  
+                else:
+                    if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                        self.df[col] = self.df[col].astype(np.float32)
+                    else:
+                        self.df[col] = self.df[col].astype(np.float64)
+        end_mem = self.df.memory_usage().sum() / 1024**2
+        if verbose:
+            print('Memory usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
 
     ### COLUMN ENGINEERING ###
     def align_cols(self, cols):
@@ -237,7 +268,7 @@ class EDA_Preprocessor:
         self.numeric_cols = self.numeric_cols + columns
         print("Size of the new data:", self.df.shape)
 
-    ### DISTRIBUTION PLOTS ###
+    ### OUTLIER DETECTION ###    
     def get_outliers(self, cols=None):
         """ check numeric outliers by percentile analysis
         """  
@@ -263,6 +294,25 @@ class EDA_Preprocessor:
                     }, ignore_index=True)
         return outlier_df
 
+    def isolation_forest_anomaly_detection(self, cols=None, contamination=0.05):
+        """ apply isolation forest model to detect anomaly/outliers 
+            in the data. identify if a point is: 
+                + an outlier (-1) or 
+                + an inlier (1) with the value specified in anomaly column
+        """
+        isof = IsolationForest(contamination=contamination,random_state=42)
+        df_anomaly = self.df.copy()
+        if cols is None:  
+            cols = self.numeric_cols + self.binary_cols
+        isof.fit(df_anomaly[cols])
+        df_anomaly['anomaly_scores'] = isof.decision_function(df_anomaly[cols])
+        df_anomaly['anomaly'] = isof.predict(df_anomaly[cols])
+        # drop outliers
+        anomaly_indexes = df_anomaly[df_anomaly['anomaly'] == -1].index
+        self.df = self.df.drop(index=anomaly_indexes).reset_index(drop=True)
+        return df_anomaly
+
+    ### DISTRIBUTION PLOTS ###
     def distribution_vs_gaussian(self, col=None, name=""):
         """ show the distribution of given column vs gaussian
             if no column given then check for the target column
@@ -372,7 +422,8 @@ class EDA_Preprocessor:
 
     def compare_two_data(self, df, cols=None, method="cdf", name=""):
         """ checking whether distributions of the given columns are similar 
-            or not in two datasets
+            or not in two datasets: this can be used to detect possible
+            covariance shift btw. training and test sets
         """
         if cols is None:  
             cols = self.numeric_cols + self.binary_cols + self.categorical_cols
@@ -474,19 +525,25 @@ class EDA_Preprocessor:
             nans = self.df.isna().sum()
             print(nans[nans > threshold].sort_values(ascending=False))
 
-    def nullity_heatmap(self):
-        """ heatmap visualization of nullity correlation 
-            correlation ranges from:
-             + -1: if one variable appears the other definitely does not
-             +  0: variables appearing or not appearing have no effect on one another
-             +  1: if one variable appears the other definitely also does
+    def nullity_plot(self, method):
+        """ various plots to explain and identify nullity or completeness
+            of the data
+             1) method == heatmap: correlation ranges from:
+                + -1: if one variable appears the other definitely does not
+                +  0: variables appearing or not appearing have no effect on one another
+                +  1: if one variable appears the other definitely also does
+             2) method == dendogram: hierarchical clustering algorithm
+             3) method == bar: number of non-null values per each feature
+             4) method == matrix: shows how missing data is distributed
         """
-        msno.heatmap(self.df)
-
-    def nullity_dendrogram(self):
-        """ hierarchical clustering algorithm to the variables
-        """
-        msno.dendrogram(self.df, figsize=(20, 8))
+        if method == "heatmap":
+            msno.heatmap(self.df) # figsize=(x, y)
+        elif method == "dendrogram":
+            msno.dendrogram(self.df)
+        elif method == "bar":
+            msno.bar(self.df)
+        elif method == "matrix":
+            msno.matrix(self.df)
 
     def replace_inf_values(self, value=None):
         """ get rid of inf values 
@@ -746,30 +803,44 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("Target needs to be a continuous numeric feature!")
 
-    def power_transformation(self):
+    def power_transformation(self, verbose=False):
         """ do power transformation on the numeric columns to handle skewness 
             of the data and make it more closer to normal distribution
         """                          
-        power = PowerTransformer(method='yeo-johnson', standardize=True)
+        power = PowerTransformer(method='yeo-johnson')
         self.df[self.numeric_cols] = pd.DataFrame(data = power.fit_transform(self.df[self.numeric_cols]), columns=self.numeric_cols)   
-        print("Power transformation is done on the following numeric columns: total = ", len(self.numeric_cols), 
-              "\n", self.numeric_cols)     
+        print("Power transformation is done: number of columns transformed = ", len(self.numeric_cols))
+        if verbose: 
+            print(self.numeric_cols) 
         return power 
 
-    def standardizer(self):
+    def quantile_transformation(self, n_quantiles=1000, output_distribution='uniform', verbose=False):
+        """ do quantile transformation on the numeric columns to handle skewness 
+            of the data and make it more closer to normal distribution or uniform
+            distribution as you like
+        """                          
+        quantile = QuantileTransformer(n_quantiles=n_quantiles, output_distribution=output_distribution)
+        self.df[self.numeric_cols] = pd.DataFrame(data = quantile.fit_transform(self.df[self.numeric_cols]), columns=self.numeric_cols)   
+        print("Quantile transformation is done: number of columns transformed = ", len(self.numeric_cols))
+        if verbose: 
+            print(self.numeric_cols)     
+        return quantile 
+
+    def standardization(self, verbose=False):
         """ do standardization on the numeric columns
         """              
         scaler = StandardScaler()
         self.df[self.numeric_cols] = pd.DataFrame(data = scaler.fit_transform(self.df[self.numeric_cols]), columns=self.numeric_cols)     
-        print("Standardization is done on the following numeric columns: total = ", len(self.numeric_cols), 
-              "\n", self.numeric_cols)     
+        print("Standardization is done: number of columns transformed = ", len(self.numeric_cols))
+        if verbose: 
+            print(self.numeric_cols) 
         return scaler
 
     def apply_transformer(self, transformer):
         """ apply transformation given a transformer object 
         """  
         self.df[self.numeric_cols] = pd.DataFrame(data = transformer.transform(self.df[self.numeric_cols]), columns=self.numeric_cols)   
-        print("Transformation object is used to transform the following numeric columns: total = ", len(self.numeric_cols), 
+        print("Transformation object is applied: number of columns transformed = ", len(self.numeric_cols), 
               "\n", self.numeric_cols)    
               
     def show_skewness(self):

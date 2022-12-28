@@ -11,7 +11,7 @@ from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMClassifier
 from pathos.helpers import cpu_count
 from pathos.pools import ProcessPool
-from sklearn.ensemble import BaggingClassifier, ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier, StackingClassifier, VotingClassifier, AdaBoostClassifier
+from sklearn.ensemble import BaggingClassifier, ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier, StackingClassifier, VotingClassifier
 from sklearn.linear_model import LinearRegression, LogisticRegression, RidgeClassifier, SGDClassifier
 from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, precision_score, f1_score, roc_auc_score
 from sklearn.model_selection import cross_val_predict, train_test_split
@@ -20,25 +20,27 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.preprocessing import LabelEncoder
 from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
+from xgboost import XGBClassifier
 
 
 class Classifier:
 
     dict_classifiers = {
-        "LR": LogisticRegression(random_state=42),
-        "Ridge": RidgeClassifier(random_state=42),
-        "KNC": KNeighborsClassifier(),
-        "SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
-        "GBC": GradientBoostingClassifier(random_state=42),
-        "SGD": SGDClassifier(random_state=42),
-        "DTC": DecisionTreeClassifier(random_state=42),
+        "LogR": LogisticRegression(random_state=42),
+        "RidgeC": RidgeClassifier(random_state=42),
         "GNB": GaussianNB(),
-        "Bagging": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
+        "AdaC": AdaBoostClassifier(random_state=42),
+        "SGDC": SGDClassifier(random_state=42),
+        "GBC": GradientBoostingClassifier(random_state=42),
+        "XGBC": XGBClassifier(random_state=42),
         "LGBMC": LGBMClassifier(random_state=42),
+        "BaggingC": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
+        "SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
+        "KNC": KNeighborsClassifier(),
+        "DTC": DecisionTreeClassifier(random_state=42),
         "RFC": RandomForestClassifier(random_state=42),
-        "Ada": AdaBoostClassifier(random_state=42),
-        "Extra": ExtraTreesClassifier(max_depth=None, random_state=42),
-        "CatBoost": CatBoostClassifier(silent=True, random_state=42)
+        "ExtraC": ExtraTreesClassifier(max_depth=None, random_state=42),
+        "CatBC": CatBoostClassifier(silent=True, random_state=42)
     }
     
     def __init__(self, data, keep_cols, target, online=False):
@@ -74,30 +76,19 @@ class Classifier:
               "\tX:", self.X.shape, "\n",
               "\ty:", self.y.shape)
 
-    def generate_train_test(self):
+    def generate_train_test(self, test_size=0.25, verbose=False):
         """ create train test sets for modeling
         """
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=0.3, random_state=42, shuffle=True)
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=test_size, random_state=42, stratify=self.y)
         if not self.not_categorical_target:
             self.encoded_y_train = self.le.transform(self.y_train)
             self.encoded_y_test = self.le.transform(self.y_test)
-        print("Train data size:", self.X_train.shape, "\nTrain target distribution:\n", self.y_train.value_counts())
-        print("Test data size:", self.X_test.shape, "\nTest target distribution:\n", self.y_test.value_counts())
-
-    def generate_train_test_by_given_gmlids(self, gmlids):
-        """ create train test sets for modeling
-        """
-        train_indexes = self.data[~self.data.gmlid.isin(gmlids)].index
-        test_indexes = self.data[self.data.gmlid.isin(gmlids)].index
-        self.X_train = self.X.iloc[train_indexes]
-        self.X_test = self.X.iloc[test_indexes]
-        self.y_train = self.y.iloc[train_indexes]
-        self.y_test = self.y.iloc[test_indexes]
-        if not self.not_categorical_target:
-            self.encoded_y_train = self.le.transform(self.y_train)
-            self.encoded_y_test = self.le.transform(self.y_test)
-        print("Train data size:", self.X_train.shape, "\nTrain target distribution:\n", self.y_train.value_counts())
-        print("Test data size:", self.X_test.shape, "\nTest target distribution:\n", self.y_test.value_counts())
+        print("Train data size:", self.X_train.shape)
+        if verbose:
+            print("Train target distribution:\n", self.y_train.value_counts())
+        print("Test data size:", self.X_test.shape) 
+        if verbose:
+            print("Test target distribution:\n", self.y_test.value_counts())
 
     ### OVERSAMPLING / DATA AUGMENTATION ###
     def oversampling(self, k):
@@ -229,9 +220,12 @@ class Classifier:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
     ### SCORE MODELS ###
-    def experiment_models(self, cv=5, score="weighted", in_test=False):
+    def experiment_models(self, by_test=True, cv=5, score="weighted"):
         """ check model performances with parallel computing
         """
+        if by_test:            
+            if not hasattr(self, 'X_train'): 
+                self.generate_train_test() 
         cores = cpu_count()
         pool = ProcessPool(cores)
         model_names = list(self.dict_classifiers.keys())
@@ -240,7 +234,7 @@ class Classifier:
         print(f"Running models parallel with {cores} cores:", model_names)
         n_models = len(models)
         try:
-            if in_test == True:
+            if by_test == True:
                 scores_data = pool.amap(self.score_in_test, models, model_names, [score] * n_models)
             else:
                 scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models, [score] * n_models)
@@ -252,7 +246,7 @@ class Classifier:
             print(f"\nCouldn't run parallel because of the following exception:", e)
             scores_data = []
             for m_name, model in self.dict_classifiers.items():
-                if in_test == True:
+                if by_test == True:
                     scores_data.append(self.score_in_test(model, m_name, score))
                 else:
                     scores_data.append(self.cv_score_model(model, m_name, cv, score))      
@@ -276,7 +270,7 @@ class Classifier:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        elif model == "lr":
+        elif model == "logr":
             model = LogisticRegression(random_state=42)
         elif model == "best":
             model = self.best_model
@@ -287,10 +281,10 @@ class Classifier:
         if model_name == "":
             model_name = extract_model_name(model)
         y = self.y.copy()
-        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
+        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
             y = self.encoded_y.copy()
         self.pred_test = cross_val_predict(model, self.X, y, cv=cv) 
-        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
+        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
             self.pred_test = self.le.inverse_transform(self.pred_test)  
         self.model = model
         scores = classification_metrics(self.y, self.pred_test, score, model_name)  
@@ -307,7 +301,7 @@ class Classifier:
                     model = self.model
                 else:
                     raise AssertionError("Please pass over a model to proceed!")
-            elif model == "lr":
+            elif model == "logr":
                 model = LogisticRegression(random_state=42)
             elif model == "best":
                 model = self.best_model
@@ -318,11 +312,11 @@ class Classifier:
             if model_name == "":
                 model_name = extract_model_name(model)
             y_train = self.y_train 
-            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
+            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
                 y_train = self.encoded_y_train
             model.fit(self.X_train, y_train)
             self.pred_test = model.predict(self.X_test)
-            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
+            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
                 self.pred_test = self.le.inverse_transform(self.pred_test)  
             self.model = model
             scores = classification_metrics(self.y_test, self.pred_test, score, model_name) 
@@ -340,7 +334,7 @@ class Classifier:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        elif model == "lr":
+        elif model == "logr":
             model = LogisticRegression(random_state=42)
         elif model == "best":
             model = self.best_model
@@ -460,7 +454,7 @@ class Classifier:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        elif model == "lr":
+        elif model == "logr":
             model = LogisticRegression(random_state=42)
         elif model == "best":
             model = self.best_model
@@ -470,7 +464,7 @@ class Classifier:
             model = self.voting_model()
         model_name = extract_model_name(model)
         y = self.y.copy()
-        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
+        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
             y = self.encoded_y.copy()
         model.fit(self.X, y)
         print("Model is fit on whole data!")
@@ -488,7 +482,7 @@ class Classifier:
         if hasattr(self, 'trained_model'): 
             model_name = extract_model_name(self.trained_model)
             preds = self.trained_model.predict(df_X)
-            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBoost"]):
+            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
                 preds = self.le.inverse_transform(preds)
             df["prediction"] = preds
             df["prediction_prob"] = pd.Series(map(lambda i: tuple(i), self.trained_model.predict_proba(df_X)))

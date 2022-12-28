@@ -13,35 +13,37 @@ from lightgbm import LGBMRegressor
 from pathos.helpers import cpu_count
 from pathos.pools import ProcessPool
 from sklearn.kernel_ridge import KernelRidge
-from sklearn.linear_model import LinearRegression, Lasso, Ridge, ElasticNet
+from sklearn.linear_model import LinearRegression, Lasso, Ridge, ElasticNet, SGDRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.svm import SVR
-from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, BaggingRegressor, StackingRegressor, VotingRegressor
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, BaggingRegressor, AdaBoostRegressor, StackingRegressor, VotingRegressor
 from xgboost import XGBRegressor
 
 
 class Regressor:
         
     dict_regressors = {
-        "LR": LinearRegression(),
-        "Ridge": Ridge(random_state=42),
+        "LinR": LinearRegression(),
+        "RidgeR": Ridge(random_state=42),
         "Lasso": Lasso(random_state=42),
         "ENet": ElasticNet(random_state=42),
         "KRR": KernelRidge(),
-        "KNC": KNeighborsRegressor(),
-        "SVR": SVR(), # kernel == 'poly' | 'linear' | 'sigmoid'
+        "AdaR": AdaBoostRegressor(random_state=42),
+        "SGDR": SGDRegressor(random_state=42),
         "GBR": GradientBoostingRegressor(random_state=42),
         "XGBR": XGBRegressor(random_state=42),
         "LGBMR": LGBMRegressor(random_state=42),
+        "BaggingR": BaggingRegressor(random_state=42),
+        "SVR": SVR(), # kernel == 'poly' | 'linear' | 'sigmoid'
+        "KNR": KNeighborsRegressor(),
         "DTR": DecisionTreeRegressor(random_state=42),
         "RFR": RandomForestRegressor(random_state=42),
-        "Bagging": BaggingRegressor(random_state=42),
-        "Extra": ExtraTreesRegressor(random_state=42),
-        "CatBoost": CatBoostRegressor(silent=True, random_state=42)
+        "ExtraR": ExtraTreesRegressor(random_state=42),
+        "CatBR": CatBoostRegressor(silent=True, random_state=42)
     }
 
     def __init__(self, data, keep_cols, target, transform=None, ref_col=None, online=False):
@@ -82,10 +84,10 @@ class Regressor:
                 "\tX:", self.X.shape, "\n",
                 "\ty:", self.y.shape)
 
-    def generate_train_test(self):
+    def generate_train_test(self, test_size=0.25):
         """ create train test sets for modeling
         """
-        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=0.3, random_state=42, shuffle=True)
+        self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=test_size, random_state=42, shuffle=True)
         print("Train data size:", self.X_train.shape)
         print("Test data size:", self.X_test.shape)
 
@@ -142,9 +144,12 @@ class Regressor:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
     ### SCORE MODELS ###
-    def experiment_models(self, cv=5, in_test=False):
+    def experiment_models(self, by_test=True, cv=5):
         """ check model performances with parallel computing
         """
+        if by_test:            
+            if not hasattr(self, 'X_train'): 
+                self.generate_train_test() 
         cores = cpu_count()
         pool = ProcessPool(cores)
         model_names = list(self.dict_regressors.keys())
@@ -153,7 +158,7 @@ class Regressor:
         print(f"Running models parallel with {cores} cores:", model_names)
         n_models = len(models)
         try:
-            if in_test == True:
+            if by_test == True:
                 scores_data = pool.amap(self.score_in_test, models, model_names)
             else:
                 scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models)
@@ -164,7 +169,7 @@ class Regressor:
             print(f"\nCouldn't run parallel because of the following exception:", e)
             scores_data = []
             for m_name, model in self.dict_regressors.items():
-                if in_test == True:
+                if by_test == True:
                     scores_data.append(self.score_in_test(model, m_name))
                 else:
                     scores_data.append(self.cv_score_model(model, m_name, cv))      
@@ -188,7 +193,7 @@ class Regressor:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        elif model == "lr":
+        elif model == "linr":
             model = LinearRegression()
         elif model == "best":
             model = self.best_model
@@ -222,7 +227,7 @@ class Regressor:
                     model = self.model
                 else:
                     raise AssertionError("Please pass over a model to proceed!")
-            elif model == "lr":
+            elif model == "linr":
                 model = LinearRegression()
             elif model == "best":
                 model = self.best_model
@@ -428,7 +433,7 @@ class Regressor:
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        elif model == "lr":
+        elif model == "linr":
             model = LinearRegression()
         elif model == "best":
             model = self.best_model
