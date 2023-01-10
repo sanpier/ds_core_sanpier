@@ -12,7 +12,7 @@ from lightgbm import LGBMClassifier
 from pathos.helpers import cpu_count
 from pathos.pools import ProcessPool
 from sklearn.ensemble import BaggingClassifier, ExtraTreesClassifier, RandomForestClassifier, GradientBoostingClassifier, AdaBoostClassifier, StackingClassifier, VotingClassifier
-from sklearn.linear_model import LinearRegression, LogisticRegression, RidgeClassifier, SGDClassifier
+from sklearn.linear_model import LinearRegression, LogisticRegression, RidgeClassifier
 from sklearn.metrics import confusion_matrix, accuracy_score, recall_score, precision_score, f1_score, roc_auc_score
 from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.naive_bayes import GaussianNB
@@ -30,7 +30,6 @@ class Classifier:
         "RidgeC": RidgeClassifier(random_state=42),
         "GNB": GaussianNB(),
         "AdaC": AdaBoostClassifier(random_state=42),
-        "SGDC": SGDClassifier(random_state=42),
         "GBC": GradientBoostingClassifier(random_state=42),
         "XGBC": XGBClassifier(random_state=42),
         "LGBMC": LGBMClassifier(random_state=42),
@@ -492,23 +491,17 @@ class Classifier:
 
     ### EXPLAIN MODEL ###
     def explain_model_with_shap(self, model=None):
-        """ show SHAP values to explain the output of the regression model
-        """
+        """ show SHAP values to explain the output of the classification model
+        """            
         if model is None:
             if hasattr(self, 'model'): 
                 model = self.model
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        # fit the model
-        self.train_model(model)
-        # set important features
-        importances = model.feature_importances_
-        sorted_idx = importances.argsort()[(-1*self.X.shape[1]):]
-        important_features = self.X.columns[sorted_idx].tolist() 
-        # get shap summary plot
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(self.X)
-        shap.summary_plot(shap_values, self.X, feature_names = important_features)
+        model.fit(self.X, self.y)
+        explainer = shap.Explainer(model)
+        shap_values = explainer(self.X)
+        shap.plots.beeswarm(shap_values)
 
 
 ### AUXILIARY FUNCTIONS ###

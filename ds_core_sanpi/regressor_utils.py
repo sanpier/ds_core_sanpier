@@ -13,7 +13,7 @@ from lightgbm import LGBMRegressor
 from pathos.helpers import cpu_count
 from pathos.pools import ProcessPool
 from sklearn.kernel_ridge import KernelRidge
-from sklearn.linear_model import LinearRegression, Lasso, Ridge, ElasticNet, SGDRegressor
+from sklearn.linear_model import LinearRegression, Lasso, Ridge, ElasticNet
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import cross_val_predict, train_test_split
@@ -33,7 +33,6 @@ class Regressor:
         "ENet": ElasticNet(random_state=42),
         "KRR": KernelRidge(),
         "AdaR": AdaBoostRegressor(random_state=42),
-        "SGDR": SGDRegressor(random_state=42),
         "GBR": GradientBoostingRegressor(random_state=42),
         "XGBR": XGBRegressor(random_state=42),
         "LGBMR": LGBMRegressor(random_state=42),
@@ -255,22 +254,25 @@ class Regressor:
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
-    def scores_for_multi_output(self):
+    def scores_for_multi_output(self, by_test=False):
         """ score multi-output regression predictions individually
         """
         if hasattr(self, 'pred_test'): 
             if self.problem == "multi_output":
                 y = self.y.copy()
                 pred_test = self.pred_test.copy()
-                if hasattr(self, 'X_train'):
-                    y = self.y_test.copy()
-                    if self.transform == "ratio": 
-                        for i in range(self.y.shape[1]):
-                            pred_test[:,i] = self.X_test[self.ref_col] / pred_test[:,i] 
-                            y.iloc[:,i] = self.X_test[self.ref_col] / y.iloc[:,i]
-                    elif self.transform == "log": 
-                        pred_test = np.exp(pred_test)
-                        y = np.exp(y) 
+                if by_test:
+                    if hasattr(self, 'X_train'):
+                        y = self.y_test.copy()
+                        if self.transform == "ratio": 
+                            for i in range(self.y.shape[1]):
+                                pred_test[:,i] = self.X_test[self.ref_col] / pred_test[:,i] 
+                                y.iloc[:,i] = self.X_test[self.ref_col] / y.iloc[:,i]
+                        elif self.transform == "log": 
+                            pred_test = np.exp(pred_test)
+                            y = np.exp(y) 
+                    else:
+                        raise AssertionError("Model predictions for the test data is needed first!")
                 else:
                     if self.transform == "ratio":      
                         for i in range(self.y.shape[1]):
@@ -454,8 +456,20 @@ class Regressor:
             df_X = df[self.features]
         except Exception as e:
             print("Given data doesn't have the same set of features as training!")
-        if hasattr(self, 'trained_model'): 
-            df["prediction"] = self.trained_model.predict(df_X)
+        if hasattr(self, 'trained_model'):
+            # do predictions by trained model
+            preds = self.trained_model.predict(df_X)
+            # transform predictions if necessary
+            if self.transform == "ratio":          
+                preds = self.df_X[self.ref_col] / preds
+            elif self.transform == "log": 
+                preds = np.exp(preds)
+            # map predictions
+            if self.problem == "single_output":
+                df["prediction"] = preds           
+            elif self.problem == "multi_output":
+                for i in range(self.y.shape[1]):
+                    df[f"prediction_{i}"] = preds[:,i]
             return df
         else:
             raise AssertionError("Please first train a model then predict on the test data!")
@@ -466,19 +480,26 @@ class Regressor:
         """
         if model is None:
             if hasattr(self, 'model'): 
-                model = self.model
+                if self.problem == "single_output":
+                    model = self.model
+                elif self.problem == "multi_output":
+                    model = self.model.estimator
             else:
                 raise AssertionError("Please pass over a model to proceed!")
-        # fit the model
-        self.train_model(model)
-        # set important features
-        importances = model.feature_importances_
-        sorted_idx = importances.argsort()[(-1*self.X.shape[1]):]
-        important_features = self.X.columns[sorted_idx].tolist() 
-        # get shap summary plot
-        explainer = shap.TreeExplainer(model)
-        shap_values = explainer.shap_values(self.X)
-        shap.summary_plot(shap_values, self.X, feature_names = important_features)
+        # single output
+        if self.problem == "single_output":
+            model.fit(self.X, self.y)
+            explainer = shap.Explainer(model)
+            shap_values = explainer(self.X)
+            shap.plots.beeswarm(shap_values)
+        # multi output
+        elif self.problem == "multi_output":
+            for i in range(self.y.shape[1]):
+                print(self.target[i])
+                model = model.fit(self.X, self.y.iloc[:, i])
+                explainer = shap.Explainer(model)
+                shap_values = explainer(self.X)
+                shap.plots.beeswarm(shap_values)
 
     def regression_plots(self, lower_threshold=0.4, higher_threshold=2.5, res=0.05, name=''):
         """ 4 regression plots to understand the prediction vs ground-truth

@@ -118,8 +118,7 @@ class EDA_Preprocessor:
                     else:
                         self.df[col] = self.df[col].astype(np.float64)
         end_mem = self.df.memory_usage().sum() / 1024**2
-        if verbose:
-            print('Memory usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
+        print('Memory usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
 
     ### COLUMN ENGINEERING ###
     def align_cols(self, cols):
@@ -479,48 +478,49 @@ class EDA_Preprocessor:
     def check_missing_values(self, threshold = 50, name=""):
         """ test how target is changing for the samples where the features are null
         """
-        if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
-            # missing values
-            nans = self.df.isna().sum()
-            nans = nans[nans > 50].sort_values(ascending=False)
-            if len(nans) > 0:
-                # start by plotting the bell curve
-                plt.figure(figsize=(15, 6))
-                z_ticks = np.linspace(-3.5, 3.5, 61)
-                pdf = stats.norm.pdf(z_ticks)
-                plt.plot(z_ticks, pdf)
-                # what is average of target
-                avg_target_population = self.df[self.target].mean()
-                # calculate the conditional average target for every missing feature
-                print('feature                                         #_missing     avg_target         z    p-value')
-                for f in nans.index.tolist():
-                    sample_size = self.df[f].isna().sum()
-                    avg_target_sample = self.df[self.df[f].isna()][self.target].mean()
-                    z = (avg_target_sample - avg_target_population) / (self.df[self.target].std() / np.sqrt(sample_size))
-                    plt.scatter([z], [stats.norm.pdf(z)], c='r' if abs(z) > 2 else 'g', s=100)
-                    print(f"{f:45} :   {sample_size:7}        {avg_target_sample:7.3f}     {z:5.2f}      {2*stats.norm.cdf(-abs(z)):.3f}")
-                    if abs(z) > 1: plt.annotate(f"{f}: {avg_target_sample:.3f}",
-                                                (z, stats.norm.pdf(z)),
-                                                xytext=(0,10), 
-                                                textcoords='offset points', ha='left' if z > 0 else 'right',
-                                                color='r' if abs(z) > 2 else 'g')
-                # annotate the center (z=0)
-                plt.vlines([0], 0, 0.05, color='g')
-                plt.annotate(f"z_score = 0\naverage target: {avg_target_population:.3f}",
-                                                    (0, 0.05),
+        if self.target != "":  
+            if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
+                # missing values
+                nans = self.df.isna().sum()
+                nans = nans[nans > 50].sort_values(ascending=False)
+                if len(nans) > 0:
+                    # start by plotting the bell curve
+                    plt.figure(figsize=(15, 6))
+                    z_ticks = np.linspace(-3.5, 3.5, 61)
+                    pdf = stats.norm.pdf(z_ticks)
+                    plt.plot(z_ticks, pdf)
+                    # what is average of target
+                    avg_target_population = self.df[self.target].mean()
+                    # calculate the conditional average target for every missing feature
+                    print('feature                                         #_missing     avg_target         z    p-value')
+                    for f in nans.index.tolist():
+                        sample_size = self.df[f].isna().sum()
+                        avg_target_sample = self.df[self.df[f].isna()][self.target].mean()
+                        z = (avg_target_sample - avg_target_population) / (self.df[self.target].std() / np.sqrt(sample_size))
+                        plt.scatter([z], [stats.norm.pdf(z)], c='r' if abs(z) > 2 else 'g', s=100)
+                        print(f"{f:45} :   {sample_size:7}        {avg_target_sample:7.3f}     {z:5.2f}      {2*stats.norm.cdf(-abs(z)):.3f}")
+                        if abs(z) > 1: plt.annotate(f"{f}: {avg_target_sample:.3f}",
+                                                    (z, stats.norm.pdf(z)),
                                                     xytext=(0,10), 
-                                                    textcoords='offset points', ha='center',
-                                                    color='g')
-                plt.title('Average target when feature is missing')
-                plt.yticks([])
-                plt.xlabel('z_score')
-                plt.show()
-                if self.online_run:
-                    filepath=f'./outputs/null_vs_target_{name}.png'
-                    plt.savefig(filepath, dpi=600)
-                    plt.close() 
+                                                    textcoords='offset points', ha='left' if z > 0 else 'right',
+                                                    color='r' if abs(z) > 2 else 'g')
+                    # annotate the center (z=0)
+                    plt.vlines([0], 0, 0.05, color='g')
+                    plt.annotate(f"z_score = 0\naverage target: {avg_target_population:.3f}",
+                                                        (0, 0.05),
+                                                        xytext=(0,10), 
+                                                        textcoords='offset points', ha='center',
+                                                        color='g')
+                    plt.title('Average target when feature is missing')
+                    plt.yticks([])
+                    plt.xlabel('z_score')
+                    plt.show()
+                    if self.online_run:
+                        filepath=f'./outputs/null_vs_target_{name}.png'
+                        plt.savefig(filepath, dpi=600)
+                        plt.close() 
         else:
-            print("The target variable should be numeric to see statistics about target!")
+            print("The target variable should be set and numeric to see statistics related to that!")
             print("Null value counts per feature:")
             nans = self.df.isna().sum()
             print(nans[nans > threshold].sort_values(ascending=False))
@@ -588,8 +588,7 @@ class EDA_Preprocessor:
         ).fillna(0)
         # filling categorical cols with unknown class
         self.df[self.categorical_cols] = self.df[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
-        print("After filling missing values in EDA data:")
-        print(self.df.isna().sum())
+        print("All missing values in the data is imputed now!")
 
     def fill_given_col_by_mode(self, fill_col, by_mode_col):
         """ fill column by other column's mode
@@ -722,6 +721,7 @@ class EDA_Preprocessor:
                 value = df_ground_truth[self.target].mean()
             self.df.loc[self.df[col] == cat, col] = value
             self.dict_encoder[col][cat] = value
+        self.dict_encoder[col]["Unknown"] = df_ground_truth[self.target].mean()
         self.df[col] = self.df[col].astype("float")
 
     def target_encoding(self, category_threshold, value_threshold, all_of_them=False):
@@ -751,15 +751,19 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("The classification problem is not applicable for target encoding!")
 
-    def apply_target_encoding(self, df, encoder):
+    def apply_target_encoding(self, encoder, df=None):
         """ given the dataframe and encoder dictionary this function applies 
             the categorical encoding to the data provided
         """
-        # apply target encoding
-        for i in list(encoder.keys()):
-            if i in df.columns:
-                df[i] = df[i].map(encoder[i])
-        return df
+        if df is None:  
+            for i in list(encoder.keys()):
+                if i in self.df.columns:
+                    self.df[i] = self.df[i].map(encoder[i])
+        else:
+            for i in list(encoder.keys()):
+                if i in df.columns:
+                    df[i] = df[i].map(encoder[i])
+            return df
 
     def target_encoding_by_lib(self, method="target"):
         """ target encoding by category_encoders library
