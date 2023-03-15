@@ -755,14 +755,15 @@ class EDA_Preprocessor:
         """ given the dataframe and encoder dictionary this function applies 
             the categorical encoding to the data provided
         """
+        # if no dataframe provided then do it to the instance of this class
         if df is None:  
             for i in list(encoder.keys()):
                 if i in self.df.columns:
-                    self.df[i] = self.df[i].map(encoder[i])
+                    self.df[i] = self.df[i].map(encoder[i]).fillna(encoder[i]["Unknown"])
         else:
             for i in list(encoder.keys()):
                 if i in df.columns:
-                    df[i] = df[i].map(encoder[i])
+                    df[i] = df[i].map(encoder[i]).fillna(encoder[i]["Unknown"])
             return df
 
     def target_encoding_by_lib(self, method="target"):
