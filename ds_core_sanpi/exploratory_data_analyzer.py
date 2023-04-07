@@ -8,6 +8,7 @@ import pingouin as pg
 import re
 import seaborn as sns
 import statsmodels.api as sm
+import sweetviz as sv
 import warnings
 from azureml.core import Run
 from category_encoders import TargetEncoder, LeaveOneOutEncoder, WOEEncoder
@@ -153,7 +154,8 @@ class EDA_Preprocessor:
         self.numeric_cols = natsorted(list(set(self.numeric_cols).difference(set(cols))))
         self.categorical_cols = natsorted(list(set(self.categorical_cols).union(set(cols))))        
         for i in cols:
-            self.df[i] = self.df[i].apply(lambda v: str(int(v)) if not pd.isnull(v) else None)
+            if i in list(self.df.columns):
+                self.df[i] = self.df[i].apply(lambda v: str(int(v)) if not pd.isnull(v) else None)
         all_cols = self.keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
         if self.target != "": 
             all_cols = all_cols + [self.target]
@@ -474,6 +476,18 @@ class EDA_Preprocessor:
         del temp
         gc.collect()
     
+    def html_eda_report(self, df=None):
+        """ sweetviz EDA report as an html page
+        """
+        if df is None:
+            html_report = sv.analyze(self.df)
+        else:
+            feature_config = sv.FeatureConfig(skip=self.keep_cols)
+            all_cols = self.keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
+            df = df[all_cols]
+            html_report = sv.compare([self.df, "Train"], [df, "Test"], self.target, feature_config)
+        html_report.show_html("EDA_report.html")
+
     ### IMPUTATION FUNTIONS & FILL MISSING VALUES ###
     def check_missing_values(self, threshold = 50, name=""):
         """ test how target is changing for the samples where the features are null
@@ -519,11 +533,9 @@ class EDA_Preprocessor:
                         filepath=f'./outputs/null_vs_target_{name}.png'
                         plt.savefig(filepath, dpi=600)
                         plt.close() 
-        else:
-            print("The target variable should be set and numeric to see statistics related to that!")
-            print("Null value counts per feature:")
-            nans = self.df.isna().sum()
-            print(nans[nans > threshold].sort_values(ascending=False))
+        print("Null value counts per feature:")
+        nans = self.df.isna().sum()
+        print(nans[nans > threshold].sort_values(ascending=False))
 
     def nullity_plot(self, method):
         """ various plots to explain and identify nullity or completeness
