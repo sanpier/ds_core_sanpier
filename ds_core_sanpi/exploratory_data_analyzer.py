@@ -162,19 +162,19 @@ class EDA_Preprocessor:
         self.df = self.df[all_cols]
 
     ### DIMENSIONALITY REDUCTION ###
-    def pca_decomposition(self, cols=None, n_components=-1, name=""):
+    def pca_decomposition(self, cols=None, n_components=-1, prefix="", name=""):
         """ PCA decomposition of the data for dimensionality
             reduction
         """
-        if not hasattr(self, 'decomposition_cols'):
-            self.decomposition_cols = cols
-            if cols is None:  
-                self.decomposition_cols = self.numeric_cols
+        if cols is None:  
+            cols = self.numeric_cols
         if n_components == -1:
-            n_components = int(math.sqrt(len(self.decomposition_cols)))
+            n_components = int(math.sqrt(len(cols)))
         pca = PCA(n_components=n_components)
-        pca_clusters = pca.fit_transform(self.df[self.decomposition_cols])
+        pca_clusters = pca.fit_transform(self.df[cols])
         pca_columns = ['pca_' + str(i+1) for i in range(n_components)]
+        if prefix != "":
+            pca_columns = [prefix + "_" + col for col in pca_columns]
         df_pca = pd.DataFrame(data = pca_clusters, columns = pca_columns)
         self.df = pd.concat([self.df, df_pca], axis = 1)
         self.numeric_cols = self.numeric_cols + pca_columns
@@ -193,21 +193,21 @@ class EDA_Preprocessor:
               "\nTotal variance explained:", sum(exp_var).round(3))
         return pca
     
-    def linear_discriminant_analysis(self, cols=None, n_components=-1, name=""):
+    def linear_discriminant_analysis(self, cols=None, n_components=-1, prefix="", name=""):
         """ Linear discriminant analysis of the data for dimensionality
             reduction
         """
         if self.target != "":
-            if not hasattr(self, 'decomposition_cols'):
-                self.decomposition_cols = cols
-                if cols is None:  
-                    self.decomposition_cols = self.numeric_cols
+            if cols is None:  
+                cols = self.numeric_cols
             if n_components == -1:
-                n_components = self.df[self.target].nunique()-1
+                n_components = int(math.sqrt(len(cols)))
             print(n_components)
             lda = LinearDiscriminantAnalysis(n_components=n_components)
-            lda_clusters = lda.fit_transform(self.df[self.decomposition_cols], self.df[self.target])
+            lda_clusters = lda.fit_transform(self.df[cols], self.df[self.target])
             lda_columns = ['lda_' + str(i+1) for i in range(n_components)]
+            if prefix != "":
+                lda_columns = [prefix + "_" + col for col in lda_columns]
             df_lda = pd.DataFrame(data = lda_clusters, columns = lda_columns)
             self.df = pd.concat([self.df, df_lda], axis = 1)
             self.numeric_cols = self.numeric_cols + lda_columns
@@ -228,18 +228,18 @@ class EDA_Preprocessor:
         else:
             raise AssertionError("A target is needed to use this function!")
 
-    def truncated_svd(self, cols=None, n_components=-1, name=""):
+    def truncated_svd(self, cols=None, n_components=-1, prefix="", name=""):
         """ Dimensionality reduction by singular value decomposition
         """
-        if not hasattr(self, 'decomposition_cols'):
-            self.decomposition_cols = cols
-            if cols is None:  
-                self.decomposition_cols = self.numeric_cols
+        if cols is None:  
+            cols = self.numeric_cols
         if n_components == -1:
-            n_components = int(math.sqrt(len(self.decomposition_cols)))
+            n_components = int(math.sqrt(len(cols)))
         svd = TruncatedSVD(n_components=n_components)
-        svd_clusters = svd.fit_transform(self.df[self.decomposition_cols])
+        svd_clusters = svd.fit_transform(self.df[cols])
         svd_columns = ['svd_' + str(i+1) for i in range(n_components)]
+        if prefix != "":
+            svd_columns = [prefix + "_" + col for col in svd_columns]
         df_svd = pd.DataFrame(data = svd_clusters, columns = svd_columns)
         self.df = pd.concat([self.df, df_svd], axis = 1)
         self.numeric_cols = self.numeric_cols + svd_columns
@@ -804,8 +804,10 @@ class EDA_Preprocessor:
             cats = self.df[cat_col_i].value_counts()[lambda x: x > value_threshold].index
             df_cat_col_dummified = pd.get_dummies(pd.Categorical(self.df[cat_col_i], categories=cats)).rename(columns = lambda x: str(f"{cat_col_i}_{x}").lower())
             self.df = pd.concat([self.df, df_cat_col_dummified], axis=1, join='inner')
+            self.binary_cols = natsorted(self.binary_cols + df_cat_col_dummified.columns.tolist())
         # drop categorical columns and standardize new dummy column names
         self.df.drop(columns=self.categorical_cols, axis=1, inplace=True)
+        self.categorical_cols = []
         self.df = self.df.rename(columns = lambda x: standardize_column_name(x))
         print("Shape after dummification:", self.df.shape)
 
@@ -962,9 +964,8 @@ class EDA_Preprocessor:
         """ get feature importance by LGBMClassifier model
         """
         if self.target != "": 
-            # split data into X and y haven't been done yet
-            if not hasattr(self, 'X'): 
-                self.split_x_and_y()
+            # split data into X and y
+            self.split_x_and_y()
             # define the model
             if model is None: 
                 if self.problem == "classification":
@@ -996,9 +997,8 @@ class EDA_Preprocessor:
         """ get feature importance by LOFO
         """
         if self.target != "": 
-            # split data into X and y haven't been done yet
-            if not hasattr(self, 'X'): 
-                self.split_x_and_y()
+            # split data into X and y
+            self.split_x_and_y()
             # calcluate the LOFO importance dataframe
             df_lofo = pd.concat([self.X, self.y], axis=1)
             dataset = Dataset(df=df_lofo, target=self.target, features=self.X.columns)
