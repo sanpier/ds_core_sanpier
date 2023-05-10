@@ -501,7 +501,7 @@ class Regressor:
                 shap_values = explainer(self.X)
                 shap.plots.beeswarm(shap_values)
 
-    def regression_plots(self, lower_threshold=0.4, higher_threshold=2.5, res=0.05, name=''):
+    def regression_plots(self, name=''):
         """ 4 regression plots to understand the prediction vs ground-truth
             results better
         """
@@ -510,21 +510,21 @@ class Regressor:
         actual_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"actual")]
         error_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"error")]
         percentage_error_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"percentage_error")]
-        ratio_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"ratio")]
         evaluation_cols = [col_i for col_i in df_residuals.columns if col_i.startswith(f"evaluation")]
         for i in range(len(prediction_cols)):
             fig, axes = plt.subplots(2, 2, figsize=(18, 14))
-            # 1. histogram distribution
+            # 1. histogram error distribution
             plt.figure(figsize=(24, 18))
-            df_residuals_ = df_residuals[(df_residuals[ratio_cols[i]] > lower_threshold) & (df_residuals[ratio_cols[i]] < higher_threshold)]  
-            sns.histplot(data=df_residuals.iloc[df_residuals_.index], x=ratio_cols[i], hue=evaluation_cols[i], binwidth=res,
+            df_residuals_ = df_residuals[(df_residuals["percentage_error"] >= -1) & (df_residuals["percentage_error"] <= 1)] 
+            sns.histplot(data=df_residuals_, x=percentage_error_cols[i], hue=evaluation_cols[i], binwidth=0.05, bins=np.arange(-1.0, 1.1, 0.1), binrange=[-1.0, 1.0],
                          palette={"5%":  "#205072", 
                                   "10%": "#33709c", 
                                   "15%": "#329D9C",
                                   "25%": "#56C596",
                                   "50%": "#7BE495",
                                   "off": "#CFF4D2"}, hue_order = ["5%", "10%", "15%", "25%", "50%", "off"], ax=axes[0][0])
-            axes[0][0].set(xlabel='Ratio', ylabel='Count', title='Histogram Distribution of Ratio')
+            axes[0][0].set(xlabel='Percentage Error', ylabel='Count', title='Histogram Distribution of Percentage Errors')
+            axes[0][0].set_xticks(np.arange(-1.0, 1.1, 0.1))
             # 2. plot regression plot in colors
             palette={"5%":  "#1c3e5c",  
                      "10%": "#224b6e",

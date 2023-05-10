@@ -521,13 +521,9 @@ def apply_confusion_matrix(y, preds, labels, online_run=False, name=""):
     """ confusion matrix of the classification 
     """        
     cf_matrix = confusion_matrix(y, preds, labels=labels)
-    cf_matrix_percentage = cf_matrix.astype('float') / cf_matrix.sum(axis=1)[:, np.newaxis] 
     fig_unit_size = len(labels)           
-    sns.set(rc={'figure.figsize':(fig_unit_size*5, fig_unit_size*2)})
-    fig, axs = plt.subplots(ncols=2)
-    fig.suptitle(f"Confusion Matrix", fontsize=20)
-    g1 = sns.heatmap(cf_matrix, annot=True, fmt='g', cmap='Blues', ax=axs[0])
-    g2 = sns.heatmap(cf_matrix_percentage, annot=True, fmt='.1%', cmap='Blues', ax=axs[1])
+    sns.set(rc={'figure.figsize':(fig_unit_size*3, fig_unit_size*2.5)})
+    g1 = sns.heatmap(cf_matrix, annot=True, fmt='g', cmap='Blues')
     g1.set_xlabel('Predicted Values')
     g1.set_ylabel('Actual Values ')
     g1.xaxis.set_ticklabels(labels)
@@ -535,13 +531,6 @@ def apply_confusion_matrix(y, preds, labels, online_run=False, name=""):
     if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())):
         g1.set_xticklabels(g1.get_xticklabels(), rotation=30)
         g1.set_yticklabels(g1.get_xticklabels(), rotation=0)
-    g2.set_xlabel('Predicted Values')
-    g2.set_ylabel('Actual Values ')
-    g2.xaxis.set_ticklabels(labels)
-    g2.yaxis.set_ticklabels(labels)
-    if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())):
-        g2.set_xticklabels(g2.get_xticklabels(), rotation=30)
-        g2.set_yticklabels(g2.get_xticklabels(), rotation=0)
     plt.show()
     # save figure if on cloud
     if online_run:
