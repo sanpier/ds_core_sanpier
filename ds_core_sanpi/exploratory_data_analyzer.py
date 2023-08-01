@@ -87,7 +87,7 @@ class EDA_Preprocessor:
                 print("Rows with null target values are dropped:", self.df.shape)
         self.df.reset_index(inplace=True, drop=True)
         print("EDA data is now as follows:")
-        print(self.df.info())
+        print(self.df.info(verbose=True, show_counts=True))
         self.online_run = online_run        
         if self.online_run:
             self.run = Run.get_context()
@@ -280,7 +280,7 @@ class EDA_Preprocessor:
         for col in cols:
             lower, upper, total = calc_interquartile(self.df, col)
             if total != 0:
-                outlier_df = outlier_df.append({
+                row_df = pd.DataFrame([{
                     'Feature': col, 
                     'Total Outliers': total,
                     'Lower limit': lower,
@@ -292,7 +292,8 @@ class EDA_Preprocessor:
                     '95th': "{:.2f}".format(np.nanpercentile(self.df[col], 95)),
                     '99th': "{:.2f}".format(np.nanpercentile(self.df[col], 99)),
                     'Max': "{:.2f}".format(np.nanpercentile(self.df[col], 100))
-                    }, ignore_index=True)
+                }])
+                outlier_df = pd.concat([outlier_df, row_df], axis=0, ignore_index=True)
         return outlier_df
 
     def isolation_forest_anomaly_detection(self, cols=None, contamination=0.05):
@@ -338,8 +339,6 @@ class EDA_Preprocessor:
             wrt. given hue value, or without a hue value
         """
         if hue == "target":
-            if self.problem != "classification":
-                raise AssertionError("Hue value can't be the target for regression problems!")
             hue = self.target
         if cols is None:  
             cols = self.numeric_cols + self.binary_cols + self.categorical_cols
@@ -397,29 +396,26 @@ class EDA_Preprocessor:
     def rolling_window_correlation_plot(self, cols=None, name=""):
         """ rolling window correlation of given columns with respect to target
         """
-        if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
-            if cols is None:  
-                cols = self.numeric_cols
-            nrows = int(len(cols) / 3) + 1
-            fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
-            rolling_num = round(len(self.df) / 5)
-            for ax, feature in zip(axes.ravel()[:len(cols)], cols):
-                temp = self.df.sort_values(feature)
-                temp.reset_index(inplace=True)
-                ax.scatter(temp.index, temp[self.target].rolling(rolling_num).mean(), s=1, alpha=0.5)
-                ax.set_xlabel(feature)
-                del temp
-                gc.collect()
-            for ax in axes.ravel()[len(cols):]:
-                ax.set_visible(False)
-            fig.tight_layout()
-            plt.show()
-            if self.online_run:
-                filepath=f'./outputs/rolling_window_correlation_{name}.png'
-                plt.savefig(filepath, dpi=600)
-                plt.close() 
-        else:
-            raise AssertionError("The target variable should be numeric to use this function!")
+        if cols is None:  
+            cols = self.numeric_cols
+        nrows = int(len(cols) / 3) + 1
+        fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
+        rolling_num = round(len(self.df) / 5)
+        for ax, feature in zip(axes.ravel()[:len(cols)], cols):
+            temp = self.df.sort_values(feature)
+            temp.reset_index(inplace=True)
+            ax.scatter(temp.index, temp[self.target].rolling(rolling_num).mean(), s=1, alpha=0.5)
+            ax.set_xlabel(feature)
+            del temp
+            gc.collect()
+        for ax in axes.ravel()[len(cols):]:
+            ax.set_visible(False)
+        fig.tight_layout()
+        plt.show()
+        if self.online_run:
+            filepath=f'./outputs/rolling_window_correlation_{name}.png'
+            plt.savefig(filepath, dpi=600)
+            plt.close() 
 
     def compare_two_data(self, df, cols=None, method="cdf", name=""):
         """ checking whether distributions of the given columns are similar 
@@ -802,13 +798,13 @@ class EDA_Preprocessor:
         # generate dummies
         for cat_col_i in self.categorical_cols:
             cats = self.df[cat_col_i].value_counts()[lambda x: x > value_threshold].index
-            df_cat_col_dummified = pd.get_dummies(pd.Categorical(self.df[cat_col_i], categories=cats)).rename(columns = lambda x: str(f"{cat_col_i}_{x}").lower())
+            df_cat_col_dummified = pd.get_dummies(pd.Categorical(self.df[cat_col_i], categories=cats)).rename(
+                columns = lambda x: standardize_column_name(str(f"{cat_col_i}_{x}").lower()))
             self.df = pd.concat([self.df, df_cat_col_dummified], axis=1, join='inner')
             self.binary_cols = natsorted(self.binary_cols + df_cat_col_dummified.columns.tolist())
         # drop categorical columns and standardize new dummy column names
         self.df.drop(columns=self.categorical_cols, axis=1, inplace=True)
         self.categorical_cols = []
-        self.df = self.df.rename(columns = lambda x: standardize_column_name(x))
         print("Shape after dummification:", self.df.shape)
 
     ### TRANSFORMATION FUNCTIONS ###
@@ -893,7 +889,7 @@ class EDA_Preprocessor:
         """ show correlation heatmap of numeric features 
         """ 
         if cols is None:  
-            if self.target != "": 
+            if (self.target != "") & (self.problem == "regression"): 
                 cols = self.numeric_cols + self.binary_cols + [self.target] 
             else:
                 cols = self.numeric_cols + self.binary_cols

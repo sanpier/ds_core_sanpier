@@ -42,12 +42,13 @@ class Classifier:
         "CatBC": CatBoostClassifier(silent=True, random_state=42)
     }
     
-    def __init__(self, data, keep_cols, target, online=False):
+    def __init__(self, data, keep_cols, target, verbose=True, online=False):
         """ construction of Classifier class 
         """
         self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + [target]))) + [target]]
         self.target = target
         self.keep_cols = keep_cols
+        self.verbose = verbose
         self.split_x_and_y() 
         self.not_categorical_target = all(data[data[target].notnull()][target].apply(lambda x: str(x).isnumeric() | isinstance(x, (int, float))))
         if self.not_categorical_target:
@@ -55,9 +56,11 @@ class Classifier:
         else:
             self.le = LabelEncoder()
             self.encoded_y = self.le.fit_transform(self.y)
-            print("Categorical target is label encoded:", pd.Series(self.encoded_y).unique())
+            if verbose:
+                print("Categorical target is label encoded:", pd.Series(self.encoded_y).unique())
             self.labels = self.le.classes_
-        print("Classifier initialized with labels:", self.labels)
+        if self.verbose:
+            print("Classifier initialized with labels:", self.labels)
         self.online_run = online
         if self.online_run:
             self.run = Run.get_context()
@@ -67,26 +70,26 @@ class Classifier:
         """ split target from the data 
         """
         self.features = sorted(list(set(self.data.columns.tolist()) - set(self.keep_cols + [self.target])))
-        if len(self.features) <= 25:
+        if self.verbose & (len(self.features) <= 25):
             print("Training will be done using the following features:\n", self.features)
         self.X = self.data[self.features].copy()
         self.y = self.data[self.target].copy()
-        print("Data is split into X and y:\n",
-              "\tX:", self.X.shape, "\n",
-              "\ty:", self.y.shape)
+        if self.verbose:
+            print("Data is split into X and y:\n",
+                  "\tX:", self.X.shape, "\n",
+                  "\ty:", self.y.shape)
 
-    def generate_train_test(self, test_size=0.25, verbose=False):
+    def generate_train_test(self, test_size=0.25):
         """ create train test sets for modeling
         """
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=test_size, random_state=42, stratify=self.y)
         if not self.not_categorical_target:
             self.encoded_y_train = self.le.transform(self.y_train)
             self.encoded_y_test = self.le.transform(self.y_test)
-        print("Train data size:", self.X_train.shape)
-        if verbose:
+        if self.verbose:
+            print("Train data size:", self.X_train.shape)
             print("Train target distribution:\n", self.y_train.value_counts())
-        print("Test data size:", self.X_test.shape) 
-        if verbose:
+            print("Test data size:", self.X_test.shape)
             print("Test target distribution:\n", self.y_test.value_counts())
 
     ### OVERSAMPLING / DATA AUGMENTATION ###
@@ -101,9 +104,10 @@ class Classifier:
             if not self.not_categorical_target:
                 self.encoded_y_train = self.le.transform(self.y_train)
                 self.encoded_y = self.le.transform(self.y)
-            print("After oversampling:\n",
-                  "\tTrain data size:", self.X_train.shape, "\n",
-                  "\tTrain target distribution:\n", self.y_train.value_counts(), "\n")          
+            if self.verbose:
+                print("After oversampling:\n",
+                    "\tTrain data size:", self.X_train.shape, "\n",
+                    "\tTrain target distribution:\n", self.y_train.value_counts(), "\n")          
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
@@ -151,9 +155,10 @@ class Classifier:
                 self.encoded_y = pd.Series(self.y.copy(), name=self.target)
                 self.y_train = pd.Series(self.le.inverse_transform(self.encoded_y_train), name=self.target)
                 self.y = pd.Series(self.le.inverse_transform(self.encoded_y), name=self.target)
-            print("After randomized smoothing:\n",
-                  "\tTrain data size:", self.X_train.shape, "\n",
-                  "\tTrain target distribution:\n", self.y_train.value_counts(), "\n")   
+            if self.verbose:
+                print("After randomized smoothing:\n",
+                    "\tTrain data size:", self.X_train.shape, "\n",
+                    "\tTrain target distribution:\n", self.y_train.value_counts(), "\n")   
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
     
@@ -212,9 +217,10 @@ class Classifier:
                 self.encoded_y = pd.Series(self.y.copy(), name=self.target)
                 self.y_train = pd.Series(self.le.inverse_transform(self.encoded_y_train), name=self.target)
                 self.y = pd.Series(self.le.inverse_transform(self.encoded_y), name=self.target) 
-            print("After randomized smoothing:\n",
-                  "\tTrain data size:", self.X_train.shape, "\n",
-                  "\tTrain target distribution:\n", self.y_train.value_counts(), "\n")   
+            if self.verbose:
+                print("After randomized smoothing:\n",
+                    "\tTrain data size:", self.X_train.shape, "\n",
+                    "\tTrain target distribution:\n", self.y_train.value_counts(), "\n")   
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
@@ -230,7 +236,8 @@ class Classifier:
         model_names = list(self.dict_classifiers.keys())
         models = list(self.dict_classifiers.values())
         # experiment bunch of regression models
-        print(f"Running models parallel with {cores} cores:", model_names)
+        if self.verbose:
+            print(f"Running models parallel with {cores} cores:", model_names)
         n_models = len(models)
         try:
             if by_test == True:
@@ -282,10 +289,10 @@ class Classifier:
         y = self.y.copy()
         if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
             y = self.encoded_y.copy()
-        self.pred_test = cross_val_predict(model, self.X, y, cv=cv) 
-        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
-            self.pred_test = self.le.inverse_transform(self.pred_test)  
+        self.pred_test = cross_val_predict(model, self.X, y, cv=cv)   
         self.model = model
+        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
+            self.pred_test = self.le.inverse_transform(self.pred_test)
         scores = classification_metrics(self.y, self.pred_test, score, model_name)  
         if confusion:
             apply_confusion_matrix(self.y, self.pred_test, self.labels, self.online_run, f"cv_{model_name}")     
@@ -310,14 +317,14 @@ class Classifier:
                 model = self.voting_model()
             if model_name == "":
                 model_name = extract_model_name(model)
-            y_train = self.y_train 
+            y_train = self.y_train.copy()
             if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
-                y_train = self.encoded_y_train
+                y_train = self.encoded_y_train.copy()
             model.fit(self.X_train, y_train)
             self.pred_test = model.predict(self.X_test)
-            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
-                self.pred_test = self.le.inverse_transform(self.pred_test)  
             self.model = model
+            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
+                self.pred_test = self.le.inverse_transform(self.pred_test)
             scores = classification_metrics(self.y_test, self.pred_test, score, model_name) 
             if confusion:
                 apply_confusion_matrix(self.y_test, self.pred_test, self.labels, self.online_run, f"test_{model_name}")    
@@ -325,7 +332,7 @@ class Classifier:
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
         
-    def cv_probability_prediction(self, model=None, cv=5):
+    def cv_probability_prediction(self, model=None, model_name="", cv=5):
         """ do a cross validation predictions with probabilities
         """
         if model is None:
@@ -341,12 +348,44 @@ class Classifier:
             model = self.stacking_model()
         elif model == "vote":
             model = self.voting_model()
+        if model_name == "":
+            model_name = extract_model_name(model)
         y = self.y.copy()
-        if not self.not_categorical_target:
+        if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
             y = self.encoded_y.copy()
         prob_pred = cross_val_predict(model, self.X, y, cv=cv, method='predict_proba')
+        self.model = model
         return pd.Series(map(lambda i: tuple(i), prob_pred))
 
+    def probability_prediction_in_test(self, model=None, model_name=""):
+        """ get classification probabilities on the generated test data
+        """
+        if hasattr(self, 'X_train'): 
+            if model is None:
+                if hasattr(self, 'model'): 
+                    model = self.model
+                else:
+                    raise AssertionError("Please pass over a model to proceed!")
+            elif model == "logr":
+                model = LogisticRegression(random_state=42)
+            elif model == "best":
+                model = self.best_model
+            elif model == "stack":
+                model = self.stacking_model()
+            elif model == "vote":
+                model = self.voting_model()
+            if model_name == "":
+                model_name = extract_model_name(model)
+            y_train = self.y_train 
+            if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
+                y_train = self.encoded_y_train
+            model.fit(self.X_train, y_train)
+            prob_pred = model.predict_proba(self.X_test)
+            self.model = model
+            return pd.Series(map(lambda i: tuple(i), prob_pred))
+        else:
+            raise AssertionError("Please first generate train & test datasets out of given data!")
+        
     ### ENSEMBL MODELS ### 
     def define_base_models(self, base_list):
         """ give a list of model abbreviations to be used
@@ -462,11 +501,15 @@ class Classifier:
         elif model == "vote":
             model = self.voting_model()
         model_name = extract_model_name(model)
+        X = self.X.copy()
         y = self.y.copy()
         if (not self.not_categorical_target) & (not model_name in ["CatBoostClassifier", "CatBC"]):
             y = self.encoded_y.copy()
-        model.fit(self.X, y)
-        print("Model is fit on whole data!")
+        if hasattr(self, 'X_train'):
+            X = X[self.X_train.columns]
+        model.fit(X, y)
+        if self.verbose:
+            print("Model is fit on whole data!")
         self.trained_model = model
 
     def predict_test(self, df):
@@ -522,7 +565,7 @@ def apply_confusion_matrix(y, preds, labels, online_run=False, name=""):
     """        
     cf_matrix = confusion_matrix(y, preds, labels=labels)
     fig_unit_size = len(labels)           
-    sns.set(rc={'figure.figsize':(fig_unit_size*3, fig_unit_size*2.5)})
+    sns.set(rc={'figure.figsize':(fig_unit_size*2, fig_unit_size*1.5)})
     g1 = sns.heatmap(cf_matrix, annot=True, fmt='g', cmap='Blues')
     g1.set_xlabel('Predicted Values')
     g1.set_ylabel('Actual Values ')
