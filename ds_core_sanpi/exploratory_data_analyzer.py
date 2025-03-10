@@ -20,21 +20,23 @@ from lofo import LOFOImportance, FLOFOImportance, Dataset, plot_importance
 from natsort import natsorted
 from regressor_utils import Regressor, regression_metrics
 from scipy import stats
-from scipy.stats import norm
+from scipy.special import inv_boxcox
+from scipy.stats import boxcox, norm
 from sklearn.decomposition import PCA, TruncatedSVD
 from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
 from sklearn.ensemble import IsolationForest
 from sklearn.experimental import enable_iterative_imputer
 from sklearn.impute import IterativeImputer
 from sklearn.preprocessing import LabelEncoder, PowerTransformer, QuantileTransformer, StandardScaler
-from sklearn.model_selection import cross_val_predict
+from sklearn.metrics import r2_score
+from sklearn.model_selection import cross_val_predict, train_test_split, KFold
 from statsmodels.graphics.gofplots import qqplot_2samples
 warnings.filterwarnings("ignore")
 
 
 class EDA_Preprocessor:
         
-    def __init__(self, data, keep_cols, drop_cols, problem, target_col="", online_run=False):
+    def __init__(self, data, keep_cols, drop_cols, problem, target_col="", verbose=True, online_run=False):
         """ construction of EDA_Preprocessor class 
         """
         # fix column names
@@ -44,6 +46,8 @@ class EDA_Preprocessor:
         target_col = standardize_column_name(target_col)
         # target 
         self.target = target_col
+        # verbose
+        self.verbose = verbose
         # problem
         if problem not in ["classification", "regression"]:
             raise AssertionError("Please define problem as one of classification or regression!")
@@ -71,11 +75,12 @@ class EDA_Preprocessor:
         numeric_cols = data.select_dtypes(include=np.number).columns.tolist()
         self.numeric_cols = natsorted(list(set(numeric_cols) - set(self.binary_cols) - set(self.categorical_cols) - set(drop_cols) - set(keep_cols) - set([target_col])))
         # report columns
-        print("EDA_Preprocessor instance initialized with data:\n",
-             f"\tKeeping columns: {len(self.keep_cols)}\n",
-             f"\tNumeric features: {len(self.numeric_cols)}\n",
-             f"\tCategorical features: {len(self.categorical_cols)}\n",
-             f"\tBinary features: {len(self.binary_cols)}")
+        if verbose:
+            print("EDA_Preprocessor instance initialized with data:\n",
+                f"\tKeeping columns: {len(self.keep_cols)}\n",
+                f"\tNumeric features: {len(self.numeric_cols)}\n",
+                f"\tCategorical features: {len(self.categorical_cols)}\n",
+                f"\tBinary features: {len(self.binary_cols)}")
         # set the final columns and data
         all_cols = self.keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
         if self.target != "": 
@@ -84,10 +89,12 @@ class EDA_Preprocessor:
         if (self.target != ""):
             if (self.df[self.df[self.target].isnull()].shape[0] > 0): 
                 self.df = self.df[self.target.notnull()]
-                print("Rows with null target values are dropped:", self.df.shape)
+                if verbose:
+                    print("Rows with null target values are dropped:", self.df.shape)
         self.df.reset_index(inplace=True, drop=True)
-        print("EDA data is now as follows:")
-        print(self.df.info(verbose=True, show_counts=True))
+        if verbose:
+            print("EDA data is now as follows:")
+            print(self.df.info(verbose=True, show_counts=True))
         self.online_run = online_run        
         if self.online_run:
             self.run = Run.get_context()
@@ -151,15 +158,17 @@ class EDA_Preprocessor:
     def convert_to_categoric(self, cols):
         """ convert given numeric columns to categorical
         """
-        self.numeric_cols = natsorted(list(set(self.numeric_cols).difference(set(cols))))
-        self.categorical_cols = natsorted(list(set(self.categorical_cols).union(set(cols))))        
-        for i in cols:
-            if i in list(self.df.columns):
-                self.df[i] = self.df[i].apply(lambda v: str(int(v)) if not pd.isnull(v) else None)
-        all_cols = self.keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
-        if self.target != "": 
-            all_cols = all_cols + [self.target]
-        self.df = self.df[all_cols]
+        cols = list(set(cols).difference(set(self.binary_cols).union(set(self.categorical_cols))))
+        if len(cols) > 0:
+            self.numeric_cols = natsorted(list(set(self.numeric_cols).difference(set(cols))))
+            self.categorical_cols = natsorted(list(set(self.categorical_cols).union(set(cols))))        
+            for i in cols:
+                if i in list(self.df.columns):
+                    self.df[i] = self.df[i].apply(lambda v: str(int(v)) if not pd.isnull(v) else None)
+            all_cols = self.keep_cols + self.numeric_cols + self.binary_cols + self.categorical_cols
+            if self.target != "": 
+                all_cols = all_cols + [self.target]
+            self.df = self.df[all_cols]
 
     ### DIMENSIONALITY REDUCTION ###
     def pca_decomposition(self, cols=None, n_components=-1, prefix="", name=""):
@@ -258,16 +267,19 @@ class EDA_Preprocessor:
               "\nTotal variance explained:", sum(exp_var).round(3))
         return svd
 
-    def apply_dimension_reduction(self, reductor, prefix, decomposition_cols):
+    def apply_dimension_reduction(self, df, reductor, prefix, decomposition_cols):
         """ apply dimension reduction to the data by the
             object that is fit before
         """
-        clusters = reductor.transform(self.df[decomposition_cols])
+        if df is None:
+            df = self.df.copy()
+        clusters = reductor.transform(df[decomposition_cols])
         columns = [f'{prefix}_' + str(i+1) for i in range(reductor.n_components)]
         df_ = pd.DataFrame(data=clusters, columns=columns)
-        self.df = pd.concat([self.df, df_], axis = 1)
+        df = pd.concat([df, df_], axis = 1)
         self.numeric_cols = self.numeric_cols + columns
-        print("Size of the new data:", self.df.shape)
+        return df
+
 
     ### OUTLIER DETECTION ###    
     def get_outliers(self, cols=None):
@@ -334,90 +346,101 @@ class EDA_Preprocessor:
             plt.savefig(filepath, dpi=600)
             plt.close() 
 
-    def feature_distributions(self, cols=None, method='kde', hue=None, name=""):
-        """ show distribution of given numeric columns in given methodology 
-            wrt. given hue value, or without a hue value
+    def feature_analysis(self, cols=None, method='kde', hue=None, name=""):
+        """
+        Feature analysis function:
+        - For numerical features: Shows distribution and rolling window correlation as two separate plots.
+        - For categorical features: Shows distribution with NULL as a category and average target.
         """
         if hue == "target":
             hue = self.target
         if cols is None:  
             cols = self.numeric_cols + self.binary_cols + self.categorical_cols
-        # remove categorical columns with too much unique values
+        # remove categorical columns with too many unique values
         cat_cols_nunique = self.df[self.categorical_cols].nunique()
         too_much_cat_values = cat_cols_nunique[cat_cols_nunique > 10].index.tolist()
         cols = natsorted([i for i in cols if i in self.numeric_cols]) + \
                natsorted([i for i in cols if i in self.binary_cols]) +  \
-               natsorted([i for i in cols if (i in self.categorical_cols) & (not i in too_much_cat_values)])
-        nrows = int(len(cols) / 3) + 1
-        fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
-        for ax, col in zip(axes.ravel()[:len(cols)], cols):
-            if col in self.numeric_cols:
-                # numeric distribution
-                if method == 'kde':
-                    sns.kdeplot(data=self.df, x=col, hue=hue, ax=ax, common_norm=False)
-                elif method == 'cdf':
-                    sns.ecdfplot(data=self.df, x=col, hue=hue, ax=ax)
-                elif method == 'hist':
-                    sns.histplot(data=self.df, x=col, alpha=0.8, hue=hue, ax=ax, common_norm=False, stat="density", discrete=True)
-                elif method == 'box':
-                    sns.boxplot(data=self.df, x=hue, y=col, ax=ax) 
-                    if hue:
-                        ax.set_xlabel(hue) 
-            else:
-                # categoric distribution
-                labels = self.df[col].value_counts().index
-                sns.countplot(x=col, data=self.df, palette="Set3", order=labels, ax=ax)
-                if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())) | \
-                    (pd.Series(labels).apply(lambda x: len(str(x))).max() == 1):
-                    ax.set_xticklabels(labels, rotation=30)
-                ax.set_xlabel(col)
-                ax.set_ylabel('counts')
-                # average of target for each category
-                if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
-                    temp = self.df[self.target].groupby(self.df[col]).agg(['mean', 'size']).reset_index().sort_values(by=['size'], ascending=False)
-                    temp[col] = temp[col].astype("object")
-                    temp = temp.set_index(col).loc[labels].reset_index()
-                    ax2 = ax.twinx()
-                    ax2.scatter(temp.index, temp['mean'], color='m', label='avg. target')
-                    ax2.set_ylim() # 0, 0.5
-                    ax2.tick_params(axis='y', colors='m')
-                    if ax == axes[0, 0]: 
-                        ax2.legend(loc='upper right')
-        for ax in axes.ravel()[len(cols):]:
-            ax.set_visible(False)
-        fig.tight_layout()
-        #plt.suptitle(f'Distributions', fontsize=20, y=1.02)
-        plt.show()
-        if self.online_run:
-            filepath=f'./outputs/numeric_distributions_{name}.png'
-            plt.savefig(filepath, dpi=600)
-            plt.close()   
+               natsorted([i for i in cols if (i in self.categorical_cols) & (i not in too_much_cat_values)])
 
-    def rolling_window_correlation_plot(self, cols=None, name=""):
-        """ rolling window correlation of given columns with respect to target
-        """
-        if cols is None:  
-            cols = self.numeric_cols
-        nrows = int(len(cols) / 3) + 1
-        fig, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
+        #### 1. numerical features: Create 4 plots per row
+        nrows = int(len(self.numeric_cols) / 2) + (len(self.numeric_cols) % 2 > 0)
+        fig, axes = plt.subplots(nrows, 4, figsize=(20, nrows * 5))
+        axes = axes.ravel()
         rolling_num = round(len(self.df) / 5)
-        for ax, feature in zip(axes.ravel()[:len(cols)], cols):
-            temp = self.df.sort_values(feature)
+        for idx, col in enumerate(self.numeric_cols):
+            # 1.1. left plot: distribution
+            ax_dist = axes[idx * 2]
+            if method == 'kde':
+                sns.kdeplot(data=self.df, x=col, hue=hue, ax=ax_dist, common_norm=False)
+            elif method == 'cdf':
+                sns.ecdfplot(data=self.df, x=col, hue=hue, ax=ax_dist)
+            elif method == 'hist':
+                sns.histplot(data=self.df, x=col, alpha=0.8, hue=hue, ax=ax_dist, common_norm=False, stat="density", discrete=True)
+            elif method == 'box':
+                sns.boxplot(data=self.df, x=hue, y=col, ax=ax_dist)
+                if hue:
+                    ax_dist.set_xlabel(hue)
+            ax_dist.set_title(f"Distribution of {col}")
+            # 1.2. right plot: rolling window correlation
+            ax_roll = axes[idx * 2 + 1]
+            temp = self.df.sort_values(col)
             temp.reset_index(inplace=True)
-            ax.scatter(temp.index, temp[self.target].rolling(rolling_num).mean(), s=1, alpha=0.5)
-            ax.set_xlabel(feature)
+            ax_roll.scatter(temp.index, temp[self.target].rolling(rolling_num).mean(), s=1, alpha=0.5, label="Rolling Target Mean")
+            # null value analysis for rolling window
+            null_mask = temp[col].isnull()
+            if null_mask.sum() > 0:
+                null_target_mean = temp.loc[null_mask, self.target].mean()
+                null_proportion = null_mask.mean()
+                ax_roll.axhline(null_target_mean, color='red', linestyle='--', label=f"Null ({null_proportion:.1%}) Target Mean: {null_target_mean:.2f}")
+            ax_roll.set_title(f"Rolling Correlation of {col}")
+            ax_roll.legend(loc='best')
             del temp
             gc.collect()
-        for ax in axes.ravel()[len(cols):]:
+        # hide unused numerical subplots
+        for ax in axes[len(self.numeric_cols) * 2:]:
             ax.set_visible(False)
         fig.tight_layout()
         plt.show()
-        if self.online_run:
-            filepath=f'./outputs/rolling_window_correlation_{name}.png'
-            plt.savefig(filepath, dpi=600)
-            plt.close() 
 
-    def compare_two_data(self, df, cols=None, method="cdf", name=""):
+        #### 2. categorical features: 3 plots per row, each showing histogram + target distribution
+        nrows = int(len(self.binary_cols + self.categorical_cols) / 3) + (len(self.binary_cols + self.categorical_cols) % 3 > 0)
+        if nrows > 0:
+            fig, axes = plt.subplots(nrows, 3, figsize=(20, nrows * 5))
+            axes = axes.ravel()
+            for idx, col in enumerate(self.binary_cols + self.categorical_cols):
+                temp_df = self.df.copy()
+                # add a category for null values
+                temp_df[col] = temp_df[col].fillna('NULL')
+                labels = temp_df[col].value_counts().index.tolist()
+                # histogram on the left y-axis
+                sns.countplot(x=col, data=temp_df, palette="Set3", order=labels, ax=axes[idx])
+                #if len(' '.join([str(x) for x in labels])) > 40:
+                #    axes[idx].set_xticklabels(labels, rotation=30)
+                axes[idx].set_ylabel('Counts')
+                # average target on the right y-axis
+                if self.target != "":
+                    if (self.problem == "regression") or self.df[self.target].isin([0, 1, np.nan]).all():
+                        temp = temp_df.groupby(col)[self.target].agg(['mean', 'size']).reset_index().sort_values(by=['size'], ascending=False)
+                        temp[col] = temp[col].astype("object")
+                        temp = temp.set_index(col).loc[labels].reset_index()
+                        ax2 = axes[idx].twinx()
+                        ax2.plot(temp.index, temp['mean'], color='m', marker='o', label='Avg. Target')
+                        ax2.tick_params(axis='y', colors='m')
+                        ax2.set_ylabel('Avg. Target', color='m')                    
+                axes[idx].set_xlabel(col)
+                axes[idx].set_title(f"Distribution and Avg. Target of {col}")
+            # hide unused categorical subplots
+            for ax in axes[len(self.binary_cols + self.categorical_cols):]:
+                ax.set_visible(False)
+            fig.tight_layout()
+            plt.show()
+        if self.online_run:
+            filepath = f'./outputs/combined_feature_analysis_{name}.png'
+            plt.savefig(filepath, dpi=600)
+            plt.close()
+
+    def compare_two_data(self, df, label1, label2, cols=None, method="cdf", name=""):
         """ checking whether distributions of the given columns are similar 
             or not in two datasets: this can be used to detect possible
             covariance shift btw. training and test sets
@@ -426,20 +449,20 @@ class EDA_Preprocessor:
             cols = self.numeric_cols + self.binary_cols + self.categorical_cols
         # remove categorical columns with too much unique values
         cat_cols_nunique = self.df[self.categorical_cols].nunique()
-        too_much_cat_values = cat_cols_nunique[cat_cols_nunique > 10].index.tolist()
+        too_much_cat_values = cat_cols_nunique[cat_cols_nunique > 12].index.tolist()
         cols = natsorted([i for i in cols if i in self.numeric_cols]) + \
                natsorted([i for i in cols if i in self.binary_cols]) +  \
                natsorted([i for i in cols if (i in self.categorical_cols) & (not i in too_much_cat_values)])
         # create one data out of both
         temp = pd.concat([self.df[cols], df[cols]], axis=0).reset_index(drop=True)
-        temp["label"] = pd.Series(["1st data"] * len(self.df) + ["2nd data"] * len(df))
-        nrows = int(len(cols) / 3) + 1
-        _, axes = plt.subplots(nrows, 3, figsize=(16, round(nrows*14/3)))
+        temp["label"] = pd.Series([label1] * len(self.df) + [label2] * len(df))
+        nrows = int(len(cols) / 4) + 1
+        _, axes = plt.subplots(nrows, 4, figsize=(16, round(nrows*14/4)))
         for ax, col in zip(axes.ravel()[:len(cols)], cols):
             if col in self.numeric_cols:
                 # numeric distribution
                 if method == 'kde':
-                    sns.kdeplot(data=temp, x=col, hue="label", ax=ax, common_norm=False)
+                    sns.kdeplot(data=temp, x=col, hue="label", ax=ax, fill=True, common_norm=False)
                 elif method == 'cdf':
                     sns.ecdfplot(data=temp, x=col, hue="label", ax=ax)
                 elif method == 'hist':
@@ -454,16 +477,18 @@ class EDA_Preprocessor:
             else:     
                 # categoric distribution
                 labels = temp[col].value_counts().index
-                sns.countplot(x=col, data=temp, order=labels, hue="label", ax=ax)
+                df = (temp.groupby(['label'])[col].value_counts(normalize=True)*100).unstack().reset_index()
+                melted_df = pd.melt(df, id_vars=['label'], var_name=col, value_name='percentage')
+                sns.barplot(data=melted_df, x=col, y='percentage', hue='label', hue_order=temp['label'].unique(), estimator=sum, ax=ax)
                 if not all(pd.Series(labels).apply(lambda x: str(x).replace(".", "").isnumeric())) | \
                     (pd.Series(labels).apply(lambda x: len(str(x))).max() == 1):
                     ax.set_xticklabels(labels, rotation=30)
                 ax.set_xlabel(col)
-                ax.set_ylabel('counts')
+                ax.set_ylabel('percentage')
         for ax in axes.ravel()[len(cols):]:
             ax.set_visible(False)
         plt.tight_layout(w_pad=1)
-        plt.suptitle('Distribution comparison of two data', fontsize=20, y=1.02)
+        plt.suptitle(f'Distribution comparison of two datasets: {label1} vs {label2}', fontsize=20, y=1.02)
         plt.show()
         if self.online_run:
             filepath=f'./outputs/qqplot_{name}.png'
@@ -572,6 +597,20 @@ class EDA_Preprocessor:
                 self.df[i] = np.where(self.df[i].isin([np.inf]), max_value, self.df[i]) 
                 self.df[i] = np.where(self.df[i].isin([-np.inf]), min_value, self.df[i]) 
             
+    def generate_null_indicators(self, cols=None):
+        """ create null indicator columns for given cols, or for all 
+        """
+        if cols is None:  
+            cols = self.numeric_cols + self.binary_cols + self.categorical_cols
+        # check given cols for null values
+        for col in cols:
+            if col in self.numeric_cols + self.binary_cols:
+                if self.df[self.df[col].isna()].shape[0] > 0:
+                    self.df[f"is_{col}_there"] = np.where(self.df[col].notna(), 1, 0)
+                    self.binary_cols = natsorted(self.binary_cols + [f"is_{col}_there"])
+            else:
+                self.df[col] = self.df[col].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
+
     def fill_missing_values(self, fill_by_zero_cols=None, strategy="mean"):
         """ fill missing numeric values by mean and categorical features 
             with 'Unknown' 
@@ -596,7 +635,8 @@ class EDA_Preprocessor:
         ).fillna(0)
         # filling categorical cols with unknown class
         self.df[self.categorical_cols] = self.df[self.categorical_cols].fillna("Unknown").replace(r'^\s*$', "Unknown", regex=True)
-        print("All missing values in the data is imputed now!")
+        if self.verbose:
+            print("All missing values in the data is imputed now!")
 
     def fill_given_col_by_mode(self, fill_col, by_mode_col):
         """ fill column by other column's mode
@@ -717,103 +757,245 @@ class EDA_Preprocessor:
         del df_copy
 
     ### HANDLE CATEGORICAL FEATURES ###
-    def target_encoding_on_column(self, col, value_threshold):
-        """ target encode the given categorical column 
-        """
-        categories = self.df[col].unique()
-        df_ground_truth = self.df[self.df[self.target].notnull()]
-        for cat in categories:
-            if self.df[self.df[col] == cat].shape[0] > value_threshold:
-                value = df_ground_truth.loc[df_ground_truth[col] == cat, self.target].mean()
-            else:
-                value = df_ground_truth[self.target].mean()
-            self.df.loc[self.df[col] == cat, col] = value
-            self.dict_encoder[col][cat] = value
-        self.dict_encoder[col]["Unknown"] = df_ground_truth[self.target].mean()
-        self.df[col] = self.df[col].astype("float")
-
-    def target_encoding(self, category_threshold, value_threshold, all_of_them=False):
-        """ target encode all categorical columns 
+    def fit_target_encoding(self, cols=None, smooth=20, n_folds=5, postfix=""):
+        """ fit smoothed target encoding on multiple features with k-fold cross-validation.
+            parameters:
+                cols: list of feature columns to encode.
+                smooth: smoothing factor (higher = closer to global mean).
+                n_folds: number of folds for cross-validation.
+            returns:
+                encoded training data and dictionary of encoding mappings.
         """
         if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
-            self.dict_encoder = defaultdict(dict)
-            if all_of_them==False:
-                # dummifiction
-                dummy_cols = [col for col in self.categorical_cols if len(self.df[col].unique()) <= category_threshold]
-                print("Dummfying ones with less than category threshold:", len(dummy_cols), "\n", dummy_cols)
-                self.df = pd.get_dummies(self.df, columns=dummy_cols)
-                self.df = self.df.rename(columns = lambda x: standardize_column_name(x))
-                # target encoding
-                target_cols = list(set(self.categorical_cols) - set(dummy_cols))
-                print("Selected categorical ones are now under the process of target encoding:", len(target_cols))
-                for category_col in target_cols:
-                    self.target_encoding_on_column(category_col, value_threshold)
-                    print(category_col, "is target encoded now!")
-            else:
-                # target encode all
-                print("All categorical ones are now under the process of target encoding:", len(self.categorical_cols))
-                for category_col in self.categorical_cols:
-                    self.target_encoding_on_column(category_col, value_threshold)
-                    print(category_col, "is target encoded now!")
-            return dict(self.dict_encoder)
+            # set columns to encode
+            if cols is None:  
+                cols = self.categorical_cols
+            if self.verbose:
+                print(f"The following {len(cols)} columns are now under the process of target encoding:\n", cols)
+            # set global mean
+            global_mean = self.df[self.target].mean() 
+            # set k-folder
+            kf = KFold(n_splits=n_folds, shuffle=True, random_state=42)
+            # store categorical encoder mappings            
+            encoding_dict = {}
+            # for all given columns
+            for col in cols:
+                encoded_feature = pd.Series(index=self.df.index, dtype=np.float32)
+                fold_mappings = []
+                # prevents leakage
+                for train_idx, val_idx in kf.split(self.df):
+                    train_fold = self.df.iloc[train_idx]
+                    val_fold = self.df.iloc[val_idx]
+                    # compute category statistics
+                    category_stats = train_fold.groupby(col)[self.target].agg(["mean", "count"])
+                    # apply smoothing
+                    category_stats["smooth_mean"] = (category_stats["mean"] * category_stats["count"] + 
+                                                    global_mean * smooth) / (category_stats["count"] + smooth)
+                    fold_mappings.append(category_stats["smooth_mean"])
+                    # assign fold values
+                    encoded_feature.iloc[val_idx] = val_fold[col].map(category_stats["smooth_mean"])
+                # final mapping: average across folds
+                final_mapping = pd.concat(fold_mappings, axis=1).mean(axis=1).to_dict()
+                # default for unseen categories
+                final_mapping["Unknown"] = global_mean
+                encoding_dict[col] = final_mapping
+                # assign to encoded features                
+                target_col = col + "_" + postfix  
+                if postfix == "": 
+                    target_col = col 
+                self.df[target_col] = self.df[col].map(final_mapping).fillna(global_mean)
+                print(col, "is target encoded now!")
+            return encoding_dict
         else:
             raise AssertionError("The classification problem is not applicable for target encoding!")
-
-    def apply_target_encoding(self, encoder, df=None):
+    
+    def apply_target_encoding(self, encoder, df=None, postfix=""):
         """ given the dataframe and encoder dictionary this function applies 
             the categorical encoding to the data provided
         """
         # if no dataframe provided then do it to the instance of this class
         if df is None:  
-            for i in list(encoder.keys()):
-                if i in self.df.columns:
-                    self.df[i] = self.df[i].map(encoder[i]).fillna(encoder[i]["Unknown"])
+            for col in list(encoder.keys()):
+                if col in self.df.columns:
+                    target_col = col + "_" + postfix  
+                    if postfix == "": 
+                        target_col = col   
+                    self.df[target_col] = self.df[col].map(encoder[col]).fillna(encoder[col]["Unknown"])
         else:
-            for i in list(encoder.keys()):
-                if i in df.columns:
-                    df[i] = df[i].map(encoder[i]).fillna(encoder[i]["Unknown"])
+            for col in list(encoder.keys()):
+                if col in df.columns:
+                    target_col = col + "_" + postfix  
+                    if postfix == "": 
+                        target_col = col   
+                    df[target_col] = df[col].map(encoder[col]).fillna(encoder[col]["Unknown"])
             return df
 
-    def target_encoding_by_lib(self, method="target"):
-        """ target encoding by category_encoders library
+    def target_encoding_by_library(self, cols=None, method="target", smoothing=None, postfix=""):
+        """ target encoding by category_encoders library with three options:
+            + target: replaces each category with the mean of the target variable.
+            + leave_one_out: similar to Target Encoding, but excludes the current row's 
+            target value when computing the mean.
+            + woe: calculates the log-odds ratio of the target within each category.
+            best for logistic regression and binary classification problems where features 
+            need monotonic transformations.
         """
+        if cols is None:  
+            cols = self.categorical_cols
         if (self.problem == "regression") | self.df[self.target].isin([0,1,np.nan]).all():
+            # choose methodology
             if method == "target":
-                encoder = TargetEncoder(handle_missing="return_nan", handle_unknown="return_nan")
+                encoder = TargetEncoder(handle_missing="return_nan", handle_unknown="return_nan", smoothing=smoothing)
             elif method == "leave_one_out":
-                encoder = LeaveOneOutEncoder(handle_missing="return_nan", handle_unknown="return_nan")
+                encoder = LeaveOneOutEncoder(handle_missing="return_nan", handle_unknown="return_nan", sigma=smoothing)
             elif method == "woe":
-                encoder = WOEEncoder(handle_missing="return_nan", handle_unknown="return_nan")
-            self.df[self.categorical_cols] = encoder.fit_transform(self.df[self.categorical_cols], self.df[self.target])
-            print("Target encoding is done on the following columns: total = ", len(self.categorical_cols), 
-                  "\n", self.categorical_cols) 
+                encoder = WOEEncoder(handle_missing="return_nan", handle_unknown="return_nan", sigma=smoothing)
+            # fit target encoding
+            encoded_values = encoder.fit_transform(self.df[cols], self.df[self.target].values)
+            # rename columns with postfix
+            if postfix:
+                encoded_values.columns = [col + "_" + postfix for col in cols]
+            else:
+                self.df.drop(columns=cols, inplace=True)
+            # join back encoded values
+            self.df = self.df.join(encoded_values)
+            print("Target encoding is done on the following columns: total = ", len(cols), "\n", cols) 
             return encoder
         else:
             raise AssertionError("The classification problem is not applicable for target encoding!")
 
-    def dummification(self, value_threshold=1000):
+    def dummification(self, cols, value_threshold=1000, drop=False):
         """ get into dummy cols out of categorical features 
         """
         print("Shape before dummification:", self.df.shape)
         # generate dummies
-        for cat_col_i in self.categorical_cols:
+        if cols is None:  
+            cols = self.categorical_cols
+        for cat_col_i in cols:
             cats = self.df[cat_col_i].value_counts()[lambda x: x > value_threshold].index
             df_cat_col_dummified = pd.get_dummies(pd.Categorical(self.df[cat_col_i], categories=cats)).rename(
                 columns = lambda x: standardize_column_name(str(f"{cat_col_i}_{x}").lower()))
             self.df = pd.concat([self.df, df_cat_col_dummified], axis=1, join='inner')
             self.binary_cols = natsorted(self.binary_cols + df_cat_col_dummified.columns.tolist())
         # drop categorical columns and standardize new dummy column names
-        self.df.drop(columns=self.categorical_cols, axis=1, inplace=True)
-        self.categorical_cols = []
+        if drop:
+            self.df.drop(columns=cols, axis=1, inplace=True)
+            if cols:
+                self.categorical_cols = natsorted(list(set(self.categorical_cols) - set(cols)))
         print("Shape after dummification:", self.df.shape)
 
     ### TRANSFORMATION FUNCTIONS ###
-    def target_log_transform(self):
-        """ do log transformation on the target variable
+    def calculate_vs_gaussian_r2(self, series=None):
+        """ calculate the r-squared between the given series and a normal distribution.
+        """
+        if series is None:  
+            series = self.df[self.target]
+        series = series.dropna().sort_values()
+        # generate theoretical normal quantiles
+        mean, std = series.mean(), series.std()
+        theoretical_quantiles = norm.ppf(np.linspace(0.01, 0.99, len(series)), loc=mean, scale=std)
+        return round(r2_score(series, theoretical_quantiles), 4)
+
+    def convert_object_to_category(self):
+        """ return a copy of the self.data with category types instead of objects 
+        """
+        df_copy = self.df.copy()
+        for col in self.categorical_cols:
+            df_copy[col] = df_copy[col].astype('category')
+        return df_copy
+    
+    def check_best_target_transformation(self, method="r2", metric="R2"):
+        """ check best possible target transformation method for closest-to-gaussian
+            + r2: check how close the transformed target to normal (gaussian) distribution by checking R2-score
+            + ml: let LGBM decides which target gets better predicted
+            the metric can be any of the regression metrics below:
+            + R2 / MAE / MAPE / RMSE / RMSLE
+        """
+        norm = self.df[self.target].copy()
+        log = np.log1p(self.df[self.target])
+        sqrt = np.sqrt(self.df[self.target])
+        cbrt = np.cbrt(self.df[self.target])
+        box, lam = boxcox(self.df[self.target] + 1)
+        transformer = PowerTransformer(method='yeo-johnson')
+        yeo = transformer.fit_transform(self.df[self.target].values.reshape(-1, 1)).flatten()
+        # set transformer parameters
+        self.box_lam = lam
+        self.yeo_transformer = transformer
+        # dict of different approaches
+        series_dict = {'norm': norm, 'log': log, 'sqrt': sqrt, 'cbrt': cbrt, 'box': box, 'yeo': yeo}
+        if method == "r2":
+            # calculate r-squared for each
+            r2_scores = {method: self.calculate_vs_gaussian_r2(pd.Series(data)) for method, data in series_dict.items()}
+            print(r2_scores)
+            # find best methodology
+            best_method = max(r2_scores, key=r2_scores.get)
+            best_r2 = r2_scores[best_method]
+            print(f"The best transformation is '{best_method}' with an R-squared of {best_r2:.4f}")
+        elif method == "ml":
+            ml_scores = {}
+            df_copy = self.convert_object_to_category()
+            # get ml scores for each
+            for i in series_dict:
+                X_train = df_copy.drop(self.keep_cols + [self.target], axis=1)
+                y_train = series_dict[i]
+                X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=42)
+                model = LGBMRegressor(random_state=42, verbose=-1)
+                model.fit(X_train, y_train)
+                y_pred = model.predict(X_val)
+                scores = regression_metrics(
+                    self.inverse_transformation(y_val, i), 
+                    self.inverse_transformation(y_pred, i)
+                )
+                ml_scores[i] = scores
+            print(ml_scores)
+            # find best methodology
+            optimizer = max if metric == "R2" else min
+            best_method = optimizer(ml_scores.items(), key=lambda x: x[1][metric])
+            print(f"The best transformation is '{best_method[0]}' with {metric} of {best_method[1][metric]:.4f}")
+
+    def inverse_transformation(self, series, method):
+        """ do inverse transformation on the given series. methods can be as follows:
+             + log:     logarithmic transformation
+             + sqrt:    square root
+             + cbrt:    cubic root
+             + box:     box-cox transformation
+             + yeo:     yeo-johnson transformation
+        """   
+        if method == "norm":
+            return series
+        elif method == "log":
+            return np.expm1(series)
+        elif method == "sqrt":
+            return np.square(series)
+        elif method == "cbrt":
+            return np.power(series, 3)
+        elif method == "box":
+            return inv_boxcox(series, self.box_lam) - 1
+        elif method == "yeo":
+            return self.yeo_transformer.inverse_transform(series.reshape(-1, 1)).flatten()
+
+    def target_transformation(self, method="log"):
+        """ do transformation on the target variable. methods can be as follows:
+             + log:     logarithmic transformation
+             + sqrt:    square root
+             + cbrt:    cubic root
+             + box:     box-cox transformation
+             + yeo:     yeo-johnson transformation
         """   
         if (self.problem == "regression"): 
-            new_target = self.target + "_log" 
-            self.df[new_target] = np.log(self.df[self.target])
+            new_target = self.target + f"_{method}"
+            if method == "log":
+                self.df[new_target] = np.log1p(self.df[self.target])
+            elif method == "sqrt":
+                self.df[new_target] = np.sqrt(self.df[self.target])
+            elif method == "cbrt":
+                self.df[new_target] = np.cbrt(self.df[self.target])
+            elif method == "box":
+                self.df[new_target], lam = boxcox(self.df[self.target] + 1)
+                self.box_lam = lam
+            elif method == "yeo":
+                transformer = PowerTransformer(method='yeo-johnson')
+                self.df[new_target] = transformer.fit_transform(self.df[self.target].values.reshape(-1, 1)).flatten()
+                self.yeo_transformer = transformer
             self.target = new_target
         else:
             raise AssertionError("Target needs to be a continuous numeric feature!")
@@ -871,7 +1053,7 @@ class EDA_Preprocessor:
         # create correlation matrix
         corr_matrix = self.df[self.numeric_cols + self.binary_cols].corr().abs().round(2)
         # select upper triangle of correlation matrix
-        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(np.bool))
+        upper = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool))
         # find features with correlation greater than threshold
         highly_corr = [column for column in upper.columns if any(upper[column] > threshold)]
         print("Highly correlated columns are:", highly_corr)
@@ -965,9 +1147,9 @@ class EDA_Preprocessor:
             # define the model
             if model is None: 
                 if self.problem == "classification":
-                    model = LGBMClassifier(random_state=42) 
+                    model = LGBMClassifier(random_state=42, verbose=-1) 
                 elif self.problem == "regression":
-                    model = LGBMRegressor(random_state=42) 
+                    model = LGBMRegressor(random_state=42, verbose=-1) 
             # fit the model
             model.fit(self.X, self.y)
             # get importances

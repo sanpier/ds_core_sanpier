@@ -28,14 +28,14 @@ class Classifier:
     dict_classifiers = {
         "LogR": LogisticRegression(random_state=42),
         "RidgeC": RidgeClassifier(random_state=42),
-        "GNB": GaussianNB(),
+        #"GNB": GaussianNB(),
         "AdaC": AdaBoostClassifier(random_state=42),
         "GBC": GradientBoostingClassifier(random_state=42),
         "XGBC": XGBClassifier(random_state=42),
-        "LGBMC": LGBMClassifier(random_state=42),
+        "LGBMC": LGBMClassifier(verbose=-1, random_state=42),
         "BaggingC": BaggingClassifier(random_state=42), # base_estimator=KNeighborsClassifier()
-        "SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
-        "KNC": KNeighborsClassifier(),
+        #"SVC": SVC(probability=True, random_state=42), # kernel == "sigmoid" | 'linear' | 'poly'
+        #"KNC": KNeighborsClassifier(),
         "DTC": DecisionTreeClassifier(random_state=42),
         "RFC": RandomForestClassifier(random_state=42),
         "ExtraC": ExtraTreesClassifier(max_depth=None, random_state=42),
@@ -355,7 +355,12 @@ class Classifier:
             y = self.encoded_y.copy()
         prob_pred = cross_val_predict(model, self.X, y, cv=cv, method='predict_proba')
         self.model = model
-        return pd.Series(map(lambda i: tuple(i), prob_pred))
+        # get predicted class (highest probability)
+        class_pred = prob_pred.argmax(axis=1)
+        df_prob = pd.DataFrame(prob_pred, columns=[f"prob_class_{i}" for i in range(prob_pred.shape[1])], index=self.X.index)
+        df_prob["highest_prob"] = prob_pred.max(axis=1)
+        df_prob["prediction"] = class_pred
+        return df_prob
 
     def probability_prediction_in_test(self, model=None, model_name=""):
         """ get classification probabilities on the generated test data
@@ -381,8 +386,13 @@ class Classifier:
                 y_train = self.encoded_y_train
             model.fit(self.X_train, y_train)
             prob_pred = model.predict_proba(self.X_test)
-            self.model = model
-            return pd.Series(map(lambda i: tuple(i), prob_pred))
+            self.model = model 
+            # get predicted class (highest probability)
+            class_pred = prob_pred.argmax(axis=1)
+            df_prob = pd.DataFrame(prob_pred, columns=[f"prob_class_{i}" for i in range(prob_pred.shape[1])], index=self.X_test.index)
+            df_prob["highest_prob"] = prob_pred.max(axis=1)
+            df_prob["prediction"] = class_pred
+            return df_prob
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
         
@@ -553,10 +563,11 @@ def classification_metrics(y_test, preds, score="weighted", model_name=""):
     """
     return {
         'model' : model_name,
-        'accuracy' : round(accuracy_score(y_test, preds, normalize=True), 3),
-        'recall' : round(recall_score(y_test, preds, average=score), 3),
-        'precision' : round(precision_score(y_test, preds, average=score), 3),
-        'f1_score' : round(f1_score(y_test, preds, average=score), 3),
+        'accuracy' : round(accuracy_score(y_test, preds, normalize=True), 5),
+        'recall' : round(recall_score(y_test, preds, average=score), 5),
+        'precision' : round(precision_score(y_test, preds, average=score), 5),
+        'f1_score' : round(f1_score(y_test, preds, average=score), 5),
+        'roc_auc' : round(roc_auc_score(y_test, preds, average=score), 5),
         'sample_size' : len(y_test)  
     }
 

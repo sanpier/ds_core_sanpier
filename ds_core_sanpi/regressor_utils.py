@@ -12,9 +12,10 @@ from imblearn.over_sampling import SMOTE
 from lightgbm import LGBMRegressor
 from pathos.helpers import cpu_count
 from pathos.pools import ProcessPool
+from scipy.special import inv_boxcox
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.linear_model import LinearRegression, Lasso, Ridge, ElasticNet
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, mean_absolute_percentage_error
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score, mean_absolute_percentage_error, root_mean_squared_log_error
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.neighbors import KNeighborsRegressor
@@ -27,25 +28,25 @@ from xgboost import XGBRegressor
 class Regressor:
         
     dict_regressors = {
-        "LinR": LinearRegression(),
-        "RidgeR": Ridge(random_state=42),
-        "Lasso": Lasso(random_state=42),
-        "ENet": ElasticNet(random_state=42),
-        "KRR": KernelRidge(),
-        "AdaR": AdaBoostRegressor(random_state=42),
+        #"LinR": LinearRegression(),
+        #"RidgeR": Ridge(random_state=42),
+        #"Lasso": Lasso(random_state=42),
+        #"ENet": ElasticNet(random_state=42),
+        #"KRR": KernelRidge(),
+        #"AdaR": AdaBoostRegressor(random_state=42),
         "GBR": GradientBoostingRegressor(random_state=42),
         "XGBR": XGBRegressor(random_state=42),
-        "LGBMR": LGBMRegressor(random_state=42),
-        "BaggingR": BaggingRegressor(random_state=42),
-        "SVR": SVR(), # kernel == 'poly' | 'linear' | 'sigmoid'
-        "KNR": KNeighborsRegressor(),
-        "DTR": DecisionTreeRegressor(random_state=42),
+        "LGBMR": LGBMRegressor(verbose=-1, random_state=42),
+        #"BaggingR": BaggingRegressor(random_state=42),
+        #"SVR": SVR(), # kernel == 'poly' | 'linear' | 'sigmoid'
+        #"KNR": KNeighborsRegressor(),
+        #"DTR": DecisionTreeRegressor(random_state=42),
         "RFR": RandomForestRegressor(random_state=42),
         "ExtraR": ExtraTreesRegressor(random_state=42),
         "CatBR": CatBoostRegressor(silent=True, random_state=42)
     }
 
-    def __init__(self, data, keep_cols, target, transform=None, ref_col=None, online=False):
+    def __init__(self, data, keep_cols, target, transform=None, transformer=None, verbose=True, online=False):
         """ construction of Regressor class 
         """
         if type(target) == list:
@@ -55,14 +56,16 @@ class Regressor:
             self.data = data[keep_cols + sorted(list(set(data.columns.tolist()) - set(keep_cols + [target]))) + [target]]
             self.problem = "single_output"
         self.target = target
-        self.transform = transform
-        self.ref_col = ref_col
+        self.transform = transform       
+        self.transformer = transformer
         self.keep_cols = keep_cols
+        self.verbose = verbose
         self.split_x_and_y()
-        if self.problem == "single_output":
-            print("Regressor initialized")
-        else:
-            print("Multi-output regressor initialized")
+        if self.verbose:
+            if self.problem == "single_output":
+                print("Regressor initialized")
+            else:
+                print("Multi-output regressor initialized")
         self.online_run = online
         if self.online_run:
             self.run = Run.get_context()
@@ -78,10 +81,11 @@ class Regressor:
         if len(self.features) <= 25:
             print("Training will be done using the following features:\n", self.features)
         self.X = self.data[self.features].copy()
-        self.y = self.data[self.target].copy()
-        print("Data is split into X and y:\n",
-                "\tX:", self.X.shape, "\n",
-                "\ty:", self.y.shape)
+        self.y = self.data[self.target].copy()   
+        if self.verbose:
+            print("Data is split into X and y:\n",
+                    "\tX:", self.X.shape, "\n",
+                    "\ty:", self.y.shape)
 
     def generate_train_test(self, test_size=0.25):
         """ create train test sets for modeling
@@ -89,6 +93,31 @@ class Regressor:
         self.X_train, self.X_test, self.y_train, self.y_test = train_test_split(self.X, self.y, test_size=test_size, random_state=42, shuffle=True)
         print("Train data size:", self.X_train.shape)
         print("Test data size:", self.X_test.shape)
+
+    def inverse_transformation(self, series):
+        """ do inverse transformation on the given series. methods can be as follows:
+             + log:     logarithmic transformation
+             + sqrt:    square root
+             + cbrt:    cubic root
+             + box:     box-cox transformation
+             + yeo:     yeo-johnson transformation
+        """   
+        if self.transform == "log":
+            return np.expm1(series)
+        elif self.transform == "sqrt":
+            return np.square(series)
+        elif self.transform == "cbrt":
+            return np.power(series, 3)
+        elif self.transform == "box":
+            if self.transformer:
+                return inv_boxcox(series, self.transformer) - 1
+            else:
+                raise AssertionError("Please provide lam parameter for Box-Cox inverse transformation!")
+        elif self.transform == "yeo":
+            if self.transformer:
+                return self.transformer.inverse_transform(series.reshape(-1, 1)).flatten()
+            else:
+                raise AssertionError("Please provide transformer for Yeo-Johnson inverse transformation!")
 
     ### OVERSAMPLING / DATA AUGMENTATION ###
     def oversampling(self, k):
@@ -208,12 +237,9 @@ class Regressor:
         self.model = model
         y = self.y.copy()
         pred_test = self.pred_test.copy()
-        if self.transform == "ratio":            
-            pred_test = self.X[self.ref_col] / pred_test
-            y = self.X[self.ref_col] / y
-        elif self.transform == "log": 
-            pred_test = np.exp(pred_test)
-            y = np.exp(y)           
+        if self.transform: 
+            pred_test = self.inverse_transformation(pred_test)
+            y = self.inverse_transformation(y)       
         scores = regression_metrics(y, pred_test, model_name)
         return scores    
 
@@ -242,13 +268,10 @@ class Regressor:
             self.pred_test = model.predict(self.X_test)
             self.model = model
             y_test = self.y_test.copy()
-            pred_test = self.pred_test.copy()
-            if self.transform == "ratio":          
-                pred_test = self.X_test[self.ref_col] / pred_test
-                y_test = self.X_test[self.ref_col] / y_test
-            elif self.transform == "log": 
-                pred_test = np.exp(pred_test)
-                y_test = np.exp(y_test) 
+            pred_test = self.pred_test.copy()            
+            if self.transform: 
+                pred_test = self.inverse_transformation(pred_test)
+                y_test = self.inverse_transformation(y_test)
             scores = regression_metrics(y_test, pred_test, model_name)
             return scores             
         else:
@@ -264,23 +287,15 @@ class Regressor:
                 if by_test:
                     if hasattr(self, 'X_train'):
                         y = self.y_test.copy()
-                        if self.transform == "ratio": 
-                            for i in range(self.y.shape[1]):
-                                pred_test[:,i] = self.X_test[self.ref_col] / pred_test[:,i] 
-                                y.iloc[:,i] = self.X_test[self.ref_col] / y.iloc[:,i]
-                        elif self.transform == "log": 
-                            pred_test = np.exp(pred_test)
-                            y = np.exp(y) 
+                        if self.transform: 
+                            pred_test = self.inverse_transformation(pred_test)
+                            y = self.inverse_transformation(y)
                     else:
                         raise AssertionError("Model predictions for the test data is needed first!")
-                else:
-                    if self.transform == "ratio":      
-                        for i in range(self.y.shape[1]):
-                            pred_test[:,i] = self.X[self.ref_col] / pred_test[:,i]  
-                            y.iloc[:,i] = self.X[self.ref_col] / y.iloc[:,i]
-                    elif self.transform == "log": 
-                        pred_test = np.exp(pred_test)
-                        y = np.exp(y)                    
+                else:  
+                    if self.transform: 
+                        pred_test = self.inverse_transformation(pred_test)
+                        y = self.inverse_transformation(y)                
                 return {y.columns[i]: regression_metrics(y.iloc[:,i], pred_test[:,i], extract_model_name(self.model)) for i in range(self.y.shape[1])}
             else:
                 raise AssertionError("This function only works when using multi-output regression models!")
@@ -297,12 +312,9 @@ class Regressor:
                 df_residuals = df_residuals.rename(columns={self.target: "actual"})
                 df_residuals["prediction"] = self.pred_test   
                 # do transformation
-                if self.transform == "ratio":          
-                    df_residuals["prediction"] = df_residuals[self.ref_col] / self.pred_test
-                    df_residuals["actual"] = df_residuals[self.ref_col] / self.y
-                elif self.transform == "log": 
-                    df_residuals["prediction"] = np.exp(self.pred_test)
-                    df_residuals["actual"] = np.exp(self.y) 
+                if self.transform: 
+                    df_residuals["prediction"] = self.inverse_transformation(self.pred_test)
+                    df_residuals["actual"] = self.inverse_transformation(self.y)
                 # calculate errors
                 df_residuals["error"] = df_residuals["prediction"] - df_residuals["actual"]
                 df_residuals["percentage_error"] = df_residuals["error"]/df_residuals["actual"] 
@@ -319,12 +331,9 @@ class Regressor:
                 df_residuals.drop(columns=self.target, inplace=True)
                 # do transformation
                 target_cols = [i for i in df_residuals.columns if i.startswith("actual_") | i.startswith("prediction_")]        
-                if self.transform == "ratio": 
+                if self.transform: 
                     for col_i in target_cols:
-                        df_residuals[col_i] = self.X[self.ref_col] / df_residuals[col_i]
-                elif self.transform == "log": 
-                    for col_i in target_cols:
-                        df_residuals[col_i] = np.exp(df_residuals[col_i])
+                        df_residuals[col_i] = self.inverse_transformation(df_residuals[col_i])
                 # calculate errors
                 for i in range(self.y.shape[1]): 
                     df_residuals[f"error_{i}"] = df_residuals[f"prediction_{i}"] - df_residuals[f"actual_{i}"]
@@ -409,14 +418,10 @@ class Regressor:
                 df_preds[f"final_pred_{i}"] = sum([df_preds[j]*coefs[i][j] for j in coefs[i].keys()])    
         # do transformation
         pred_cols = [i for i in df_preds.columns if "_pred" in i]        
-        if self.transform == "ratio": 
+        if self.transform: 
             for col_i in pred_cols:
-                df_preds[col_i] = self.X[self.ref_col] / df_preds[col_i]
-            df_preds[self.target] = self.X[self.ref_col] / df_preds[self.target]
-        elif self.transform == "log": 
-            for col_i in pred_cols:
-                df_preds[col_i] = np.exp(df_preds[col_i])
-            df_preds[self.target] = np.exp(df_preds[self.target])
+                df_preds[col_i] = self.inverse_transformation(df_preds[col_i])
+            df_preds[self.target] = self.inverse_transformation(df_preds[self.target])
         # report scores
         if self.problem == "single_output":              
             print("Ensemble scores\t:", regression_metrics(df_preds[self.target], df_preds.final_pred, model_name="Ensemble"))
@@ -447,6 +452,29 @@ class Regressor:
         print("Model is fit on whole data!")
         self.trained_model = model
 
+    def train_model_on_train(self, model=None):
+        """ train the given regression model on whole data
+        """   
+        if hasattr(self, 'X_train'):
+            if model is None:
+                if hasattr(self, 'model'): 
+                    model = self.model
+                else:
+                    raise AssertionError("Please pass over a model to proceed!")
+            elif model == "linr":
+                model = LinearRegression()
+            elif model == "best":
+                model = self.best_model
+            elif model == "stack":
+                model = self.stacking_model()
+            elif model == "vote":
+                model = self.voting_model()
+            model.fit(self.X_train, self.y_train)
+            print("Model is fit on train data!")
+            self.trained_model = model
+        else:
+            raise AssertionError("Please first generate train & test datasets out of given data!")
+
     def predict_test(self, df):
         """ predict the given data with the trained model
             and return the same data including predictions
@@ -460,10 +488,8 @@ class Regressor:
             # do predictions by trained model
             preds = self.trained_model.predict(df_X)
             # transform predictions if necessary
-            if self.transform == "ratio":          
-                preds = self.df_X[self.ref_col] / preds
-            elif self.transform == "log": 
-                preds = np.exp(preds)
+            if self.transform: 
+                preds = self.inverse_transformation(preds)
             # map predictions
             if self.problem == "single_output":
                 df["prediction"] = preds           
@@ -515,7 +541,7 @@ class Regressor:
             fig, axes = plt.subplots(2, 2, figsize=(18, 14))
             # 1. histogram error distribution
             plt.figure(figsize=(24, 18))
-            df_residuals_ = df_residuals[(df_residuals["percentage_error"] >= -1) & (df_residuals["percentage_error"] <= 1)] 
+            df_residuals_ = df_residuals[(df_residuals[percentage_error_cols[i]] >= -1) & (df_residuals[percentage_error_cols[i]] <= 1)] 
             sns.histplot(data=df_residuals_, x=percentage_error_cols[i], hue=evaluation_cols[i], binwidth=0.05, bins=np.arange(-1.0, 1.1, 0.1), binrange=[-1.0, 1.0],
                          palette={"5%":  "#205072", 
                                   "10%": "#33709c", 
@@ -684,10 +710,11 @@ def regression_metrics(y_test, pred_test, model_name=""):
     """   
     return {
         'model' : model_name,
-        'R2': round(r2_score(y_test, pred_test), 3),
-        'MAE': round(mean_absolute_error(y_test, pred_test), 3),
-        'MAPE': round(mean_absolute_percentage_error(y_test, pred_test), 3),
-        'RMSE': round(mean_squared_error(y_test, pred_test, squared=False), 3),
+        'R2': round(r2_score(y_test, pred_test), 5),
+        'MAE': round(mean_absolute_error(y_test, pred_test), 5),
+        'MAPE': round(mean_absolute_percentage_error(y_test, pred_test), 5),
+        'RMSE': round(root_mean_squared_error(y_test, pred_test), 5),
+        'RMSLE': round(root_mean_squared_log_error(y_test, pred_test), 5),
         'sample_size': len(y_test),    
     }
 
