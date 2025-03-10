@@ -88,7 +88,7 @@ class EDA_Preprocessor:
         self.df = data[all_cols]
         if (self.target != ""):
             if (self.df[self.df[self.target].isnull()].shape[0] > 0): 
-                self.df = self.df[self.target.notnull()]
+                self.df = self.df[self.df.target.notnull()]
                 if verbose:
                     print("Rows with null target values are dropped:", self.df.shape)
         self.df.reset_index(inplace=True, drop=True)
