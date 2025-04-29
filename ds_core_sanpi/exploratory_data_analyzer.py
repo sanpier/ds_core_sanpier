@@ -88,7 +88,7 @@ class EDA_Preprocessor:
         self.df = data[all_cols]
         if (self.target != ""):
             if (self.df[self.df[self.target].isnull()].shape[0] > 0): 
-                self.df = self.df[self.df.target.notnull()]
+                self.df = self.df[self.target.notnull()]
                 if verbose:
                     print("Rows with null target values are dropped:", self.df.shape)
         self.df.reset_index(inplace=True, drop=True)
@@ -98,35 +98,6 @@ class EDA_Preprocessor:
         self.online_run = online_run        
         if self.online_run:
             self.run = Run.get_context()
-
-    ### MEMORY REDUCTION ###
-    def reduce_memory_usage(self):
-        """ reduce memory used by the dataframe by converting into 
-            more memory friendly data types
-        """
-        numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
-        start_mem = self.df.memory_usage().sum() / 1024**2
-        for col in self.df.columns:
-            col_type = self.df[col].dtypes
-            if col_type in numerics:
-                c_min = self.df[col].min()
-                c_max = self.df[col].max()
-                if str(col_type)[:3] == 'int':
-                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                        self.df[col] = self.df[col].astype(np.int8)
-                    elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                        self.df[col] = self.df[col].astype(np.int16)
-                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
-                        self.df[col] = self.df[col].astype(np.int32)
-                    elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
-                        self.df[col] = self.df[col].astype(np.int64)  
-                else:
-                    if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
-                        self.df[col] = self.df[col].astype(np.float32)
-                    else:
-                        self.df[col] = self.df[col].astype(np.float64)
-        end_mem = self.df.memory_usage().sum() / 1024**2
-        print('Memory usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
 
     ### COLUMN ENGINEERING ###
     def align_cols(self, cols):
@@ -336,7 +307,12 @@ class EDA_Preprocessor:
             if self.problem != "regression":  
                 raise AssertionError("Target needs to be a continuous numeric feature!")
         _, axes = plt.subplots(1, 2, figsize=(20, 7))
-        sns.distplot(self.df[col], fit=norm, ax=axes[0])
+        sns.histplot(self.df[col], kde=True, stat="density", ax=axes[0])
+        mu, std = norm.fit(self.df[col])
+        xmin, xmax = axes[0].get_xlim()
+        x = np.linspace(xmin, xmax, 100)
+        p = norm.pdf(x, mu, std)
+        axes[0].plot(x, p, 'k', linewidth=2)
         axes[0].set(title='Distribution of target vs Gaussian')
         pg.qqplot(self.df[col], dist='norm', ax=axes[1]) 
         axes[1].set(title='QQ-Plot of Target')
@@ -346,7 +322,7 @@ class EDA_Preprocessor:
             plt.savefig(filepath, dpi=600)
             plt.close() 
 
-    def feature_analysis(self, cols=None, method='kde', hue=None, name=""):
+    def feature_analysis(self, cols=None, method='kde', hue=None, sample=None, name=""):
         """
         Feature analysis function:
         - For numerical features: Shows distribution and rolling window correlation as two separate plots.
@@ -354,37 +330,43 @@ class EDA_Preprocessor:
         """
         if hue == "target":
             hue = self.target
+        if sample:
+            data = self.df.sample(sample)
+        # remove categorical columns with too many unique values
+        cat_cols_nunique = data[self.categorical_cols].nunique()
+        too_much_cat_values = cat_cols_nunique[cat_cols_nunique > 10].index.tolist()
         if cols is None:  
             cols = self.numeric_cols + self.binary_cols + self.categorical_cols
-        # remove categorical columns with too many unique values
-        cat_cols_nunique = self.df[self.categorical_cols].nunique()
-        too_much_cat_values = cat_cols_nunique[cat_cols_nunique > 10].index.tolist()
-        cols = natsorted([i for i in cols if i in self.numeric_cols]) + \
-               natsorted([i for i in cols if i in self.binary_cols]) +  \
-               natsorted([i for i in cols if (i in self.categorical_cols) & (i not in too_much_cat_values)])
-
+            cols = natsorted([i for i in cols if i in self.numeric_cols]) + \
+                   natsorted([i for i in cols if i in self.binary_cols]) +  \
+                   natsorted([i for i in cols if (i in self.categorical_cols) & (i not in too_much_cat_values)])
+        else: 
+            cols = natsorted([i for i in cols if(i not in too_much_cat_values)])
+        numeric_cols = [i for i in cols if i in self.numeric_cols]
+        categorical_cols = [i for i in cols if i in self.binary_cols + self.categorical_cols]
+            
         #### 1. numerical features: Create 4 plots per row
-        nrows = int(len(self.numeric_cols) / 2) + (len(self.numeric_cols) % 2 > 0)
+        nrows = int(len(numeric_cols) / 2) + (len(numeric_cols) % 2 > 0)
         fig, axes = plt.subplots(nrows, 4, figsize=(20, nrows * 5))
         axes = axes.ravel()
-        rolling_num = round(len(self.df) / 5)
-        for idx, col in enumerate(self.numeric_cols):
+        rolling_num = round(len(data) / 5)
+        for idx, col in enumerate(numeric_cols):
             # 1.1. left plot: distribution
             ax_dist = axes[idx * 2]
             if method == 'kde':
-                sns.kdeplot(data=self.df, x=col, hue=hue, ax=ax_dist, common_norm=False)
+                sns.kdeplot(data=data, x=col, hue=hue, ax=ax_dist, common_norm=False)
             elif method == 'cdf':
-                sns.ecdfplot(data=self.df, x=col, hue=hue, ax=ax_dist)
+                sns.ecdfplot(data=data, x=col, hue=hue, ax=ax_dist)
             elif method == 'hist':
-                sns.histplot(data=self.df, x=col, alpha=0.8, hue=hue, ax=ax_dist, common_norm=False, stat="density", discrete=True)
+                sns.histplot(data=data, x=col, alpha=0.8, hue=hue, ax=ax_dist, common_norm=False, stat="density", discrete=True)
             elif method == 'box':
-                sns.boxplot(data=self.df, x=hue, y=col, ax=ax_dist)
+                sns.boxplot(data=data, x=hue, y=col, ax=ax_dist)
                 if hue:
                     ax_dist.set_xlabel(hue)
             ax_dist.set_title(f"Distribution of {col}")
             # 1.2. right plot: rolling window correlation
             ax_roll = axes[idx * 2 + 1]
-            temp = self.df.sort_values(col)
+            temp = data.sort_values(col)
             temp.reset_index(inplace=True)
             ax_roll.scatter(temp.index, temp[self.target].rolling(rolling_num).mean(), s=1, alpha=0.5, label="Rolling Target Mean")
             # null value analysis for rolling window
@@ -398,17 +380,17 @@ class EDA_Preprocessor:
             del temp
             gc.collect()
         # hide unused numerical subplots
-        for ax in axes[len(self.numeric_cols) * 2:]:
+        for ax in axes[len(numeric_cols) * 2:]:
             ax.set_visible(False)
         fig.tight_layout()
         plt.show()
 
         #### 2. categorical features: 3 plots per row, each showing histogram + target distribution
-        nrows = int(len(self.binary_cols + self.categorical_cols) / 3) + (len(self.binary_cols + self.categorical_cols) % 3 > 0)
+        nrows = int(len(categorical_cols) / 3) + (len(categorical_cols) % 3 > 0)
         if nrows > 0:
             fig, axes = plt.subplots(nrows, 3, figsize=(20, nrows * 5))
             axes = axes.ravel()
-            for idx, col in enumerate(self.binary_cols + self.categorical_cols):
+            for idx, col in enumerate(categorical_cols):
                 temp_df = self.df.copy()
                 # add a category for null values
                 temp_df[col] = temp_df[col].fillna('NULL')
@@ -431,7 +413,7 @@ class EDA_Preprocessor:
                 axes[idx].set_xlabel(col)
                 axes[idx].set_title(f"Distribution and Avg. Target of {col}")
             # hide unused categorical subplots
-            for ax in axes[len(self.binary_cols + self.categorical_cols):]:
+            for ax in axes[len(categorical_cols):]:
                 ax.set_visible(False)
             fig.tight_layout()
             plt.show()
@@ -803,7 +785,7 @@ class EDA_Preprocessor:
                 target_col = col + "_" + postfix  
                 if postfix == "": 
                     target_col = col 
-                self.df[target_col] = self.df[col].map(final_mapping).fillna(global_mean)
+                self.df[target_col] = encoded_feature.fillna(global_mean)
                 print(col, "is target encoded now!")
             return encoding_dict
         else:
@@ -1300,3 +1282,41 @@ def calc_interquartile(df, column):
     upper_outliers = df[df[column] > upper]
     lower_outliers = df[df[column] < lower]
     return "{:.2f}".format(lower), "{:.2f}".format(upper), lower_outliers.shape[0]+upper_outliers.shape[0]
+
+
+### MEMORY REDUCTION ###
+def reduce_memory_usage(df):
+    """ reduce memory used by the dataframe by converting into 
+        more memory friendly data types
+    """
+    numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
+    start_mem = df.memory_usage().sum() / 1024**2
+    for col in df.columns:
+        col_type = df[col].dtypes
+        # numerical
+        if col_type in numerics:
+            c_min = df[col].min()
+            c_max = df[col].max()
+            if str(col_type)[:3] == 'int':
+                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                    df[col] = df[col].astype(np.int8)
+                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                    df[col] = df[col].astype(np.int16)
+                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                    df[col] = df[col].astype(np.int32)
+                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                    df[col] = df[col].astype(np.int64)  
+            else:
+                if c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                    df[col] = df[col].astype(np.float32)
+                else:
+                    df[col] = df[col].astype(np.float64)
+        # categorical
+        elif col_type == object:
+            num_unique = df[col].nunique()
+            num_total = len(df[col])
+            if num_unique / num_total < 0.5:  # Heuristic: low cardinality
+                df[col] = df[col].astype('category')
+    end_mem = df.memory_usage(deep=True).sum() / 1024**2
+    print('Memory usage decreased to {:5.2f} Mb ({:.1f}% reduction)'.format(end_mem, 100 * (start_mem - end_mem) / start_mem))
+    return df

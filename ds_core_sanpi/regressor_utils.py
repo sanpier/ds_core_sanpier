@@ -1,4 +1,5 @@
 import matplotlib.pyplot as plt
+import multiprocessing
 import numpy as np
 import pandas as pd
 import pingouin as pg
@@ -9,19 +10,20 @@ import time
 from azureml.core import Run
 from catboost import CatBoostRegressor
 from imblearn.over_sampling import SMOTE
+from joblib import Parallel, delayed
 from lightgbm import LGBMRegressor
 from pathos.helpers import cpu_count
 from pathos.pools import ProcessPool
 from scipy.special import inv_boxcox
 from sklearn.kernel_ridge import KernelRidge
 from sklearn.linear_model import LinearRegression, Lasso, Ridge, ElasticNet
-from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score, mean_absolute_percentage_error, root_mean_squared_log_error
+from sklearn.metrics import mean_absolute_error, root_mean_squared_error, r2_score, mean_absolute_percentage_error
 from sklearn.multioutput import MultiOutputRegressor
 from sklearn.model_selection import cross_val_predict, train_test_split
 from sklearn.neighbors import KNeighborsRegressor
 from sklearn.tree import DecisionTreeRegressor
 from sklearn.svm import SVR
-from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, BaggingRegressor, AdaBoostRegressor, StackingRegressor, VotingRegressor
+from sklearn.ensemble import HistGradientBoostingRegressor, RandomForestRegressor, ExtraTreesRegressor, GradientBoostingRegressor, BaggingRegressor, AdaBoostRegressor, StackingRegressor, VotingRegressor
 from xgboost import XGBRegressor
 
 
@@ -33,16 +35,17 @@ class Regressor:
         #"Lasso": Lasso(random_state=42),
         #"ENet": ElasticNet(random_state=42),
         #"KRR": KernelRidge(),
-        #"AdaR": AdaBoostRegressor(random_state=42),
-        "GBR": GradientBoostingRegressor(random_state=42),
+        "AdaR": AdaBoostRegressor(random_state=42),
+        "HistR": HistGradientBoostingRegressor(random_state=42),
+        #"GBR": GradientBoostingRegressor(random_state=42),
         "XGBR": XGBRegressor(random_state=42),
         "LGBMR": LGBMRegressor(verbose=-1, random_state=42),
         #"BaggingR": BaggingRegressor(random_state=42),
         #"SVR": SVR(), # kernel == 'poly' | 'linear' | 'sigmoid'
         #"KNR": KNeighborsRegressor(),
         #"DTR": DecisionTreeRegressor(random_state=42),
-        "RFR": RandomForestRegressor(random_state=42),
-        "ExtraR": ExtraTreesRegressor(random_state=42),
+        #"RFR": RandomForestRegressor(random_state=42),
+        #"ExtraR": ExtraTreesRegressor(random_state=42),
         "CatBR": CatBoostRegressor(silent=True, random_state=42)
     }
 
@@ -171,44 +174,53 @@ class Regressor:
         else:
             raise AssertionError("Please first generate train & test datasets out of given data!")
 
-    ### SCORE MODELS ###
+    ### SCORE MODELS ###    
     def experiment_models(self, by_test=True, cv=5):
         """ check model performances with parallel computing
         """
-        if by_test:            
-            if not hasattr(self, 'X_train'): 
-                self.generate_train_test() 
-        cores = cpu_count()
-        pool = ProcessPool(cores)
+        def run_model(model_func, model, name, *args):
+            try:
+                return model_func(model, name, *args)
+            except Exception as e:
+                print(f"Error running model {name}: {e}")
+                return None
+        # train test split if not done yet
+        if by_test and not hasattr(self, 'X_train'):
+            self.generate_train_test()
+        # set cores and models
+        cores = multiprocessing.cpu_count()
         model_names = list(self.dict_regressors.keys())
         models = list(self.dict_regressors.values())
-        # experiment bunch of regression models
         print(f"Running models parallel with {cores} cores:", model_names)
-        n_models = len(models)
+        # set model function
+        if by_test:
+            model_func = self.score_in_test
+            args = ()
+        else:
+            model_func = self.cv_score_model
+            args = (cv,)
+        # run parallel if possible
         try:
-            if by_test == True:
-                scores_data = pool.amap(self.score_in_test, models, model_names)
-            else:
-                scores_data = pool.amap(self.cv_score_model, models, model_names, [cv] * n_models)
-            while not scores_data.ready():
-                time.sleep(5); print(".", end=' ')
-            scores_data = scores_data.get()
+            scores_data = Parallel(n_jobs=cores)(
+                delayed(run_model)(model_func, model, name, *args)
+                for model, name in zip(models, model_names)
+            )
+            scores_data = [s for s in scores_data if s is not None]
         except Exception as e:
             print(f"\nCouldn't run parallel because of the following exception:", e)
             scores_data = []
             for m_name, model in self.dict_regressors.items():
-                if by_test == True:
+                if by_test:
                     scores_data.append(self.score_in_test(model, m_name))
                 else:
-                    scores_data.append(self.cv_score_model(model, m_name, cv))      
-        df_scores = pd.DataFrame(scores_data)     
-        # sort score dataframe by R2
+                    scores_data.append(self.cv_score_model(model, m_name, cv))
+        # get score dataframe
+        df_scores = pd.DataFrame(scores_data)
         df_scores.sort_values('R2', ascending=False, inplace=True)
-        # best models => base models for stacking
+        # get best models
         self.base_models = [(df_scores.iloc[0].model, self.dict_regressors[df_scores.iloc[0].model]),
                             (df_scores.iloc[1].model, self.dict_regressors[df_scores.iloc[1].model]),
                             (df_scores.iloc[2].model, self.dict_regressors[df_scores.iloc[2].model])]
-        # set best model
         self.best_model = self.base_models[0]
         return df_scores
 
@@ -714,7 +726,6 @@ def regression_metrics(y_test, pred_test, model_name=""):
         'MAE': round(mean_absolute_error(y_test, pred_test), 5),
         'MAPE': round(mean_absolute_percentage_error(y_test, pred_test), 5),
         'RMSE': round(root_mean_squared_error(y_test, pred_test), 5),
-        'RMSLE': round(root_mean_squared_log_error(y_test, pred_test), 5),
         'sample_size': len(y_test),    
     }
 
