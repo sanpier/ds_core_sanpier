@@ -331,7 +331,9 @@ class EDA_Preprocessor:
         if hue == "target":
             hue = self.target
         if sample:
-            data = self.df.sample(sample)
+            data = self.df.sample(frac=sample)
+        else:
+            data = self.df.copy()
         # remove categorical columns with too many unique values
         cat_cols_nunique = data[self.categorical_cols].nunique()
         too_much_cat_values = cat_cols_nunique[cat_cols_nunique > 10].index.tolist()
